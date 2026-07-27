@@ -6,42 +6,73 @@ import {
   requisitionAnalysisResults,
   requisitionOverrides,
 } from "@/db/schema";
-import { eq, and, desc, asc, sql } from "drizzle-orm";
+import { eq, and, desc, asc, sql, type SQL } from "drizzle-orm";
+
+function optionalQueryParam(value: string | null): string | undefined {
+  if (value === null || value === "") {
+    return undefined;
+  }
+  return value;
+}
 
 const querySchema = z.object({
-  tenantId: z.string().uuid(),
-  mspProgramId: z.string().uuid().optional(),
-  status: z.string().optional(),
-  recommendation: z.string().optional(),
+  tenantId: z
+    .preprocess(optionalQueryParam, z.string().uuid().optional())
+    .optional(),
+  mspProgramId: z
+    .preprocess(optionalQueryParam, z.string().uuid().optional())
+    .optional(),
+  status: z.preprocess(optionalQueryParam, z.string().optional()).optional(),
+  recommendation: z
+    .preprocess(optionalQueryParam, z.string().optional())
+    .optional(),
   minOpportunityScore: z.coerce.number().min(0).max(100).optional(),
   maxOpportunityScore: z.coerce.number().min(0).max(100).optional(),
-  customer: z.string().optional(),
+  customer: z.preprocess(optionalQueryParam, z.string().optional()).optional(),
   isNewToday: z.boolean().optional(),
   page: z.coerce.number().default(1),
   limit: z.coerce.number().max(100).default(20),
-  sortBy: z.enum([
-    "opportunityScore",
-    "rank",
-    "estimatedProfitPerHour",
-    "submissionCount",
-    "lastSeenAt",
-  ]).default("rank"),
-  sortOrder: z.enum(["asc", "desc"]).default("asc"),
+  sortBy: z
+    .preprocess(
+      optionalQueryParam,
+      z
+        .enum([
+          "opportunityScore",
+          "rank",
+          "estimatedProfitPerHour",
+          "submissionCount",
+          "lastSeenAt",
+        ])
+        .default("rank")
+    )
+    .default("rank"),
+  sortOrder: z
+    .preprocess(
+      optionalQueryParam,
+      z.enum(["asc", "desc"]).default("asc")
+    )
+    .default("asc"),
 });
 
 // GET /api/requisitions - List requisitions with filters
 export async function GET(request: NextRequest) {
   try {
     const { searchParams } = new URL(request.url);
+    const tenantIdFromQuery = optionalQueryParam(searchParams.get("tenantId"));
+    const tenantId =
+      tenantIdFromQuery ?? process.env.DEFAULT_TENANT_ID ?? undefined;
+
     const params = querySchema.parse({
-      tenantId: searchParams.get("tenantId"),
+      tenantId,
       mspProgramId: searchParams.get("mspProgramId"),
       status: searchParams.get("status"),
       recommendation: searchParams.get("recommendation"),
       minOpportunityScore: searchParams.get("minOpportunityScore"),
       maxOpportunityScore: searchParams.get("maxOpportunityScore"),
       customer: searchParams.get("customer"),
-      isNewToday: searchParams.get("isNewToday") === "true",
+      isNewToday: searchParams.has("isNewToday")
+        ? searchParams.get("isNewToday") === "true"
+        : undefined,
       page: searchParams.get("page"),
       limit: searchParams.get("limit"),
       sortBy: searchParams.get("sortBy"),
@@ -51,7 +82,11 @@ export async function GET(request: NextRequest) {
     const offset = (params.page - 1) * params.limit;
 
     // Build query
-    let whereConditions = [eq(requisitions.tenantId, params.tenantId)];
+    const whereConditions: SQL[] = [];
+
+    if (params.tenantId) {
+      whereConditions.push(eq(requisitions.tenantId, params.tenantId));
+    }
 
     if (params.mspProgramId) {
       whereConditions.push(eq(requisitions.mspProgramId, params.mspProgramId));
@@ -71,11 +106,14 @@ export async function GET(request: NextRequest) {
       whereConditions.push(eq(requisitions.isNewToday, params.isNewToday));
     }
 
+    const whereClause =
+      whereConditions.length > 0 ? and(...whereConditions) : undefined;
+
     // Get total count
     const [{ count }] = await db
       .select({ count: sql<number>`count(*)` })
       .from(requisitions)
-      .where(and(...whereConditions));
+      .where(whereClause);
 
     // Build sort
     const sortColumn =
@@ -100,7 +138,7 @@ export async function GET(request: NextRequest) {
         requisitionAnalysisResults,
         eq(requisitions.id, requisitionAnalysisResults.requisitionId)
       )
-      .where(and(...whereConditions))
+      .where(whereClause)
       .orderBy(sortFn(sortColumn))
       .limit(params.limit)
       .offset(offset);
