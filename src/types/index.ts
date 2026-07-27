@@ -1,0 +1,222 @@
+import { z } from "zod";
+
+// =============================================================================
+// Extraction Schemas (Operation 1: Extract and Normalize)
+// =============================================================================
+
+export const ExtractedRequisitionOccurrenceSchema = z.object({
+  source_record_key: z.string().min(1),
+  source_file_ids: z.array(z.string().min(1)).min(1),
+
+  status: z.string().nullable(),
+  requisition_id: z.string().nullable(),
+  customer: z.string().nullable(),
+  job_title: z.string().nullable(),
+  submissions: z.number().int().nonnegative().nullable(),
+  c2c_bill_rate: z.number().nonnegative().nullable(),
+  location: z.string().nullable(),
+  start_date: z.string().nullable(),
+  duration: z.string().nullable(),
+  number_of_positions: z.number().int().nonnegative().nullable(),
+  active_submissions: z.number().int().nonnegative().nullable(),
+  released_date: z.string().nullable(),
+  position_type: z.string().nullable(),
+  remote_or_onsite: z.enum(["Remote", "Hybrid", "On-site", "Unknown"]).nullable(),
+
+  source_confidence: z.enum(["High", "Medium", "Low"]),
+  data_quality_notes: z.array(z.string()).default([]),
+});
+
+export type ExtractedRequisitionOccurrence = z.infer<typeof ExtractedRequisitionOccurrenceSchema>;
+
+export const ClaudeExtractionSchema = z.object({
+  processing_summary: z.object({
+    files_processed: z.number().int().nonnegative(),
+    screenshots_processed: z.number().int().nonnegative(),
+    spreadsheet_rows_processed: z.number().int().nonnegative(),
+    visible_rows_detected: z.number().int().nonnegative(),
+    potential_duplicates_detected: z.number().int().nonnegative(),
+    uncertain_record_count: z.number().int().nonnegative(),
+  }),
+  jobs: z.array(ExtractedRequisitionOccurrenceSchema),
+});
+
+export type ClaudeExtractionOutput = z.infer<typeof ClaudeExtractionSchema>;
+
+// =============================================================================
+// Pay and Fillability Schemas (Operation 2: Pay and Fillability Analysis)
+// =============================================================================
+
+export const ClaudePayAnalysisItemSchema = z.object({
+  requisition_id: z.string().min(1),
+
+  recommended_w2_pay_min: z.number().nonnegative().nullable(),
+  recommended_w2_pay_max: z.number().nonnegative().nullable(),
+
+  pay_estimate_reason: z.string().min(1),
+  market_rate_warning: z.string().nullable(),
+
+  fillability_score: z.number().min(0).max(100),
+  fillability_label: z.enum(["Easy", "Moderate", "Difficult", "Very Difficult", "Extremely Difficult"]),
+  fillability_reason: z.string().min(1),
+
+  suggested_risk_classification: z.enum([
+    "standard",
+    "higher_risk_technical",
+    "healthcare",
+    "manual_review",
+  ]),
+});
+
+export type ClaudePayAnalysisItem = z.infer<typeof ClaudePayAnalysisItemSchema>;
+
+export const ClaudePayAnalysisSchema = z.object({
+  jobs: z.array(ClaudePayAnalysisItemSchema),
+});
+
+export type ClaudePayAnalysisOutput = z.infer<typeof ClaudePayAnalysisSchema>;
+
+// =============================================================================
+// Legacy combined schemas (for backward compatibility during refactor)
+// =============================================================================
+
+export const ExtractedRequisitionSchema = z.object({
+  source_record_key: z.string(),
+  status: z.string().nullable(),
+  requisition_id: z.string().nullable(),
+  customer: z.string().nullable(),
+  job_title: z.string().nullable(),
+  submissions: z.number().nullable(),
+  c2c_bill_rate: z.number().nullable(),
+  location: z.string().nullable(),
+  start_date: z.string().nullable(),
+  duration: z.string().nullable(),
+  number_of_positions: z.number().nullable(),
+  active_submissions: z.number().nullable(),
+  released_date: z.string().nullable(),
+  position_type: z.string().nullable(),
+  remote_or_onsite: z.enum(["Remote", "Hybrid", "On-site", "Unknown"]).nullable(),
+  source_confidence: z.enum(["High", "Medium", "Low"]),
+  data_quality_notes: z.array(z.string()).default([]),
+});
+
+export type ExtractedRequisition = z.infer<typeof ExtractedRequisitionSchema>;
+
+export const PayAnalysisResultSchema = z.object({
+  source_record_key: z.string(),
+  recommended_w2_pay_min: z.number(),
+  recommended_w2_pay_max: z.number(),
+  fillability_score: z.number().min(0).max(100),
+  fillability_label: z.enum(["Easy", "Moderate", "Difficult", "Very Difficult", "Extremely Difficult"]),
+  pay_estimate_reason: z.string(),
+  market_rate_warning: z.string().nullable(),
+});
+
+export type PayAnalysisResult = z.infer<typeof PayAnalysisResultSchema>;
+
+// =============================================================================
+// Financial Assumptions
+// =============================================================================
+
+export const FinancialAssumptionsSchema = z.object({
+  ficaPercent: z.number().default(7.65),
+  futaSutaHourly: z.number().default(0.45),
+  standardWorkersCompHourly: z.number().default(0.30),
+  highRiskWorkersCompHourly: z.number().default(0.60),
+  healthcareWorkersCompHourly: z.number().nullable(),
+  payrollProcessingHourly: z.number().default(0.25),
+  complianceHourly: z.number().default(0.20),
+  insuranceHourly: z.number().default(0.25),
+  recruitingHourly: z.number().default(1.25),
+  overheadHourly: z.number().default(0.75),
+  benefitsHourly: z.number().default(0.00),
+  ptoHourly: z.number().default(0.00),
+  otherHourlyCosts: z.number().default(0.00),
+});
+
+export type FinancialAssumptions = z.infer<typeof FinancialAssumptionsSchema>;
+
+// =============================================================================
+// Scoring Weights
+// =============================================================================
+
+export const ScoringWeightsSchema = z.object({
+  competitionWeight: z.number().default(30),
+  profitabilityWeight: z.number().default(25),
+  fillabilityWeight: z.number().default(20),
+  billRateWeight: z.number().default(15),
+  durationWeight: z.number().default(10),
+});
+
+export type ScoringWeights = z.infer<typeof ScoringWeightsSchema>;
+
+// =============================================================================
+// MSP Program Configuration
+// =============================================================================
+
+export const MSPProgramConfigSchema = z.object({
+  id: z.string().uuid(),
+  tenantId: z.string().uuid(),
+  name: z.string(),
+  platformName: z.string().optional(),
+  vendorFeeType: z.enum(["percentage", "flat_hourly", "none"]).default("percentage"),
+  vendorFeeValue: z.number().default(2.0),
+  defaultWeeklyHours: z.number().default(40),
+  currency: z.enum(["USD"]).default("USD"),
+  isActive: z.boolean().default(true),
+});
+
+export type MSPProgramConfig = z.infer<typeof MSPProgramConfigSchema>;
+
+// =============================================================================
+// Column Aliases
+// =============================================================================
+
+export const COLUMN_ALIASES: Record<string, string[]> = {
+  requisition_id: ["Req ID", "Requisition ID", "Req Number", "Requisition Number", "ID", "Req#"],
+  customer: ["Customer", "Client", "Company", "Employer"],
+  job_title: ["Job Title", "Title", "Position", "Role", "Job"],
+  submissions: ["Subs", "Submissions", "Submission Count", "Total Submissions"],
+  c2c_bill_rate: ["C2C Rate", "Bill Rate", "Rate", "C2C Bill Rate", "Pay Rate"],
+  location: ["Location", "City", "Place", "Site"],
+  start_date: ["Start Date", "Start", "Begin Date", "Start Date"],
+  duration: ["Duration", "Length", "Term", "Period"],
+  number_of_positions: ["Positions", "Pos", "Number of Positions", "Openings", "Qty"],
+  active_submissions: ["Active", "Active Submissions", "Active Subs", "In Progress"],
+  released_date: ["Released", "Released Date", "Posted Date", "Date Released"],
+  position_type: ["Type", "Position Type", "Contract Type", "Employment Type"],
+  status: ["Status", "State", "Req Status"],
+};
+
+// =============================================================================
+// Duration conversions (weeks)
+// =============================================================================
+
+export const DURATION_CONVERSIONS: Record<string, number> = {
+  "4 months": 17.3,
+  "5 months": 21.7,
+  "6 months": 26,
+  "7 months": 30.3,
+  "8 months": 34.7,
+  "9 months": 39,
+  "10 months": 43.3,
+  "11 months": 47.7,
+  "12 months": 52,
+  "1 year": 52,
+  "18 months": 78,
+  "2 years": 104,
+};
+
+// =============================================================================
+// Customer normalization aliases
+// =============================================================================
+
+export const CUSTOMER_ALIASES: Record<string, string> = {
+  "LTI": "LTI Mindtree",
+  "Fidelity": "Fidelity Investments",
+  "UHG": "UnitedHealth Group",
+  "Optum": "UnitedHealth Group / Optum",
+  "Wells": "Wells Fargo",
+  "BofA": "Bank of America",
+  "BoA": "Bank of America",
+};
