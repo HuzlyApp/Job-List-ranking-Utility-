@@ -11,7 +11,7 @@ import { ClaudeExtractionSchema, ClaudePayAnalysisSchema } from "@/types";
 // Environment / Configuration
 // ------------------------------------------------------------------------------
 
-const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
+const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY || process.env.CLAUDE_API_KEY;
 const CLAUDE_REQUISITION_MODEL =
   process.env.CLAUDE_REQUISITION_MODEL || "claude-3-5-sonnet-20241022";
 

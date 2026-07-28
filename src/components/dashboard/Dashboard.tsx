@@ -1,9 +1,11 @@
 "use client";
 
 import { useState, useEffect } from "react";
+import Link from "next/link";
 import { RequisitionTable } from "./RequisitionTable";
 import { KPICards } from "./KPICards";
 import { Filters } from "./Filters";
+import { useAppContext } from "@/lib/app-context";
 
 interface RequisitionWithAnalysis {
   requisition: {
@@ -55,11 +57,12 @@ interface DashboardData {
 }
 
 export function Dashboard() {
+  const { tenantId } = useAppContext();
   const [data, setData] = useState<DashboardData | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [filters, setFilters] = useState({
-    tenantId: "", // Would come from auth context
+    tenantId,
     mspProgramId: "",
     status: "",
     recommendation: "",
@@ -70,6 +73,12 @@ export function Dashboard() {
     page: 1,
     limit: 20,
   });
+
+  useEffect(() => {
+    fetch("/api/setup").catch(() => undefined);
+  }, []);
+
+  const hasRequisitions = (data?.pagination?.total ?? 0) > 0;
 
   useEffect(() => {
     fetchRequisitions();
@@ -151,15 +160,23 @@ export function Dashboard() {
               </p>
             </div>
             <div className="flex gap-3">
+              <Link
+                href="/requisitions/import"
+                className="px-4 py-2 text-sm font-medium text-white bg-emerald-600 rounded-md hover:bg-emerald-700"
+              >
+                Import Requisitions
+              </Link>
               <button
                 onClick={() => handleExport("csv")}
-                className="px-4 py-2 text-sm font-medium text-gray-700 bg-white border border-gray-300 rounded-md hover:bg-gray-50"
+                disabled={!hasRequisitions}
+                className="px-4 py-2 text-sm font-medium text-gray-700 bg-white border border-gray-300 rounded-md hover:bg-gray-50 disabled:opacity-50 disabled:cursor-not-allowed"
               >
                 Export CSV
               </button>
               <button
                 onClick={() => handleExport("xlsx")}
-                className="px-4 py-2 text-sm font-medium text-white bg-blue-600 rounded-md hover:bg-blue-700"
+                disabled={!hasRequisitions}
+                className="px-4 py-2 text-sm font-medium text-white bg-blue-600 rounded-md hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed"
               >
                 Export Excel
               </button>

@@ -6,12 +6,14 @@ import {
   requisitions,
   requisitionAnalysisResults,
   requisitionSnapshots,
+  mspPrograms,
 } from "@/db/schema";
-import { eq, and, desc, sql } from "drizzle-orm";
+import { eq, and, sql } from "drizzle-orm";
 import { v4 as uuidv4 } from "uuid";
 import type { ExtractedRequisition, FinancialAssumptions, ScoringWeights } from "@/types";
 import { createRequisitionIntelligenceService } from "@/lib/ai-providers";
 import { parseSpreadsheet, parseCSV, validateFileType } from "@/lib/file-parsing";
+import { saveUploadFile, loadUploadFile } from "@/lib/file-storage";
 import {
   calculateFinancials,
   calculateScores,
@@ -39,6 +41,11 @@ export interface FileUploadInput {
   mimeType: string;
   fileSize: number;
   content: Buffer;
+}
+
+export interface FileUploadResult {
+  fileId: string;
+  storageKey: string;
 }
 
 export interface ExtractionResult {
@@ -69,34 +76,40 @@ export async function createBatch(input: BatchCreationInput): Promise<Requisitio
 /**
  * Upload and process a source file
  */
-export async function uploadSourceFile(input: FileUploadInput): Promise<void> {
-  // Validate file type
+export async function uploadSourceFile(input: FileUploadInput): Promise<FileUploadResult> {
   if (!validateFileType(input.mimeType, input.filename)) {
     throw new Error(`Unsupported file type: ${input.mimeType}`);
   }
 
-  const storageKey = `uploads/${input.tenantId}/${uuidv4()}_${input.filename}`;
+  const fileId = uuidv4();
+  const storageKey = await saveUploadFile(
+    input.tenantId,
+    input.batchId,
+    input.filename,
+    input.content
+  );
 
-  // Save file metadata
   await db.insert(requisitionSourceFiles).values({
-    id: uuidv4(),
+    id: fileId,
     tenantId: input.tenantId,
     batchId: input.batchId,
     originalFilename: input.filename,
     storageKey,
     mimeType: input.mimeType,
     fileSize: input.fileSize,
-    processingStatus: "processing",
+    processingStatus: "pending",
   });
 
-  // Update batch file count
   await db
     .update(requisitionAnalysisBatches)
     .set({
       filesCount: sql`${requisitionAnalysisBatches.filesCount} + 1`,
       status: "validating",
+      startedAt: sql`COALESCE(${requisitionAnalysisBatches.startedAt}, NOW())`,
     })
     .where(eq(requisitionAnalysisBatches.id, input.batchId));
+
+  return { fileId, storageKey };
 }
 
 /**
@@ -107,13 +120,11 @@ export async function processBatchExtraction(
   tenantId: string,
   aiProvider: string = "claude"
 ): Promise<ExtractionResult> {
-  // Update status
   await db
     .update(requisitionAnalysisBatches)
-    .set({ status: "extracting" })
+    .set({ status: "parsing" })
     .where(eq(requisitionAnalysisBatches.id, batchId));
 
-  // Get source files
   const files = await db
     .select()
     .from(requisitionSourceFiles)
@@ -124,69 +135,175 @@ export async function processBatchExtraction(
       )
     );
 
-  const extractedRows: ExtractedRequisition[] = [];
+  const spreadsheetPayloads: Array<{
+    filename: string;
+    rows: Array<Record<string, unknown>>;
+  }> = [];
+  const imagePayloads: Array<{
+    filename: string;
+    base64: string;
+    mimeType: string;
+    fileId: string;
+  }> = [];
+
+  let spreadsheetRows = 0;
   let imageFiles = 0;
   let spreadsheetFiles = 0;
-  let spreadsheetRows = 0;
 
-  // Process each file
   for (const file of files) {
-    if (file.mimeType.startsWith("image/")) {
-      imageFiles++;
-      // For images, we would normally send to AI for OCR
-      // For now, skip image processing in this implementation
-    } else if (
-      file.mimeType === "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" ||
-      file.mimeType === "application/vnd.ms-excel"
-    ) {
-      spreadsheetFiles++;
-      // Load file content (in real implementation, load from storage)
-      // const content = await loadFileFromStorage(file.storageKey);
-      // const parsed = parseSpreadsheet(content, file.originalFilename);
-      // parsed.forEach(sheet => {
-      //   spreadsheetRows += sheet.rows.length;
-      //   extractedRows.push(...sheet.rows);
-      // });
-    } else if (file.mimeType === "text/csv" || file.mimeType === "application/csv") {
-      spreadsheetFiles++;
-      // const content = await loadFileFromStorage(file.storageKey);
-      // const parsed = parseCSV(content, file.originalFilename);
-      // spreadsheetRows += parsed.rows.length;
-      // extractedRows.push(...parsed.rows);
+    try {
+      const content = await loadUploadFile(file.storageKey);
+
+      if (file.mimeType.startsWith("image/")) {
+        imageFiles++;
+        imagePayloads.push({
+          filename: file.originalFilename,
+          base64: content.toString("base64"),
+          mimeType: file.mimeType,
+          fileId: file.id,
+        });
+        await db
+          .update(requisitionSourceFiles)
+          .set({ processingStatus: "parsed" })
+          .where(eq(requisitionSourceFiles.id, file.id));
+      } else if (
+        file.mimeType === "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" ||
+        file.mimeType === "application/vnd.ms-excel" ||
+        file.originalFilename.toLowerCase().endsWith(".xlsx") ||
+        file.originalFilename.toLowerCase().endsWith(".xls")
+      ) {
+        spreadsheetFiles++;
+        const parsed = parseSpreadsheet(content, file.originalFilename);
+        for (const sheet of parsed) {
+          spreadsheetRows += sheet.rows.length;
+          for (const row of sheet.rows) {
+            const enriched = {
+              ...row,
+              source_file_ids: [file.id],
+              source_record_key: `${file.id}:${sheet.sheetName}:${row.source_record_key}`,
+            };
+            await db.insert(requisitionSourceRows).values({
+              tenantId,
+              batchId,
+              sourceFileId: file.id,
+              sourceRecordKey: enriched.source_record_key,
+              sheetName: sheet.sheetName,
+              rowNumber: parseInt(enriched.source_record_key.split(":").pop() || "0", 10) || null,
+              extractedJson: enriched,
+              sourceConfidence: enriched.source_confidence,
+              dataQualityNotes: enriched.data_quality_notes || [],
+            });
+          }
+          spreadsheetPayloads.push({
+            filename: file.originalFilename,
+            rows: sheet.rows as unknown as Array<Record<string, unknown>>,
+          });
+        }
+        await db
+          .update(requisitionSourceFiles)
+          .set({ processingStatus: "parsed", pageOrSheetCount: parsed.length })
+          .where(eq(requisitionSourceFiles.id, file.id));
+      } else if (
+        file.mimeType === "text/csv" ||
+        file.mimeType === "application/csv" ||
+        file.originalFilename.toLowerCase().endsWith(".csv")
+      ) {
+        spreadsheetFiles++;
+        const parsed = parseCSV(content.toString("utf-8"), file.originalFilename);
+        spreadsheetRows += parsed.rows.length;
+        for (const row of parsed.rows) {
+          const enriched = {
+            ...row,
+            source_file_ids: [file.id],
+            source_record_key: `${file.id}:csv:${row.source_record_key}`,
+          };
+          await db.insert(requisitionSourceRows).values({
+            tenantId,
+            batchId,
+            sourceFileId: file.id,
+            sourceRecordKey: enriched.source_record_key,
+            sheetName: parsed.sheetName,
+            extractedJson: enriched,
+            sourceConfidence: enriched.source_confidence,
+            dataQualityNotes: enriched.data_quality_notes || [],
+          });
+        }
+        spreadsheetPayloads.push({
+          filename: file.originalFilename,
+          rows: parsed.rows as unknown as Array<Record<string, unknown>>,
+        });
+        await db
+          .update(requisitionSourceFiles)
+          .set({ processingStatus: "parsed" })
+          .where(eq(requisitionSourceFiles.id, file.id));
+      }
+    } catch (err) {
+      await db
+        .update(requisitionSourceFiles)
+        .set({
+          processingStatus: "failed",
+          errorMessage: err instanceof Error ? err.message : "Processing failed",
+        })
+        .where(eq(requisitionSourceFiles.id, file.id));
     }
   }
 
-  // Use AI for extraction if there are images
-  if (imageFiles > 0) {
+  await db
+    .update(requisitionAnalysisBatches)
+    .set({ status: "extracting" })
+    .where(eq(requisitionAnalysisBatches.id, batchId));
+
+  const extractedRows: ExtractedRequisition[] = [];
+
+  if (imagePayloads.length > 0) {
     const provider = createRequisitionIntelligenceService(
       aiProvider === "claude" ? undefined : aiProvider
     );
 
-    // Storage loading is not implemented in this flow yet, so pass empty payloads for now.
     const result = await provider.extractRequisitions({
-      images: [],
-      spreadsheets: [],
+      images: imagePayloads.map((img) => ({
+        filename: img.filename,
+        base64: img.base64,
+        mimeType: img.mimeType,
+      })),
+      spreadsheets: spreadsheetPayloads,
       promptVersion: "v1.0",
     });
-    extractedRows.push(...result.jobs);
+
+    for (const job of result.jobs) {
+      const fileId = imagePayloads[0]?.fileId || files[0]?.id || "";
+      const enriched = {
+        ...job,
+        source_file_ids: job.source_file_ids?.length ? job.source_file_ids : [fileId],
+        source_record_key: job.source_record_key || `${fileId}:claude:${uuidv4()}`,
+      };
+      await db.insert(requisitionSourceRows).values({
+        tenantId,
+        batchId,
+        sourceFileId: fileId,
+        sourceRecordKey: enriched.source_record_key,
+        screenshotIndex: imagePayloads.findIndex((i) => i.fileId === fileId),
+        extractedJson: enriched,
+        sourceConfidence: enriched.source_confidence,
+        dataQualityNotes: enriched.data_quality_notes || [],
+      });
+      extractedRows.push(enriched as ExtractedRequisition);
+    }
   }
 
-  // Save extracted rows
-  for (const row of extractedRows) {
-    await db.insert(requisitionSourceRows).values({
-      tenantId,
-      batchId,
-      sourceFileId: files[0]?.id || "",
-      sourceRecordKey: row.source_record_key,
-      extractedJson: row,
-      sourceConfidence: row.source_confidence,
-      dataQualityNotes: row.data_quality_notes || [],
-    });
-  }
+  const allRows = await db
+    .select()
+    .from(requisitionSourceRows)
+    .where(
+      and(
+        eq(requisitionSourceRows.batchId, batchId),
+        eq(requisitionSourceRows.tenantId, tenantId)
+      )
+    );
 
-  // Update batch status
-  const duplicatesDetected = detectDuplicates(extractedRows);
-  const uncertainCount = extractedRows.filter((r) => r.source_confidence !== "High").length;
+  const allExtracted = allRows.map((r) => r.extractedJson as ExtractedRequisition);
+  const duplicatesDetected = detectDuplicates(allExtracted);
+  const uncertainCount = allExtracted.filter((r) => r.source_confidence !== "High").length;
 
   await db
     .update(requisitionAnalysisBatches)
@@ -196,7 +313,7 @@ export async function processBatchExtraction(
         files_processed: files.length,
         screenshots_processed: imageFiles,
         spreadsheet_rows_processed: spreadsheetRows,
-        visible_rows_detected: extractedRows.length,
+        visible_rows_detected: allExtracted.length,
         potential_duplicates_detected: duplicatesDetected.length,
         uncertain_record_count: uncertainCount,
       },
@@ -205,7 +322,7 @@ export async function processBatchExtraction(
 
   return {
     batchId,
-    extractedRows,
+    extractedRows: allExtracted,
     duplicatesDetected: duplicatesDetected.length,
     uncertainCount,
   };
@@ -254,7 +371,7 @@ export async function deduplicateRequisitions(
   
   // Group by requisition ID
   for (const row of rows) {
-    const data = row.extractedJson as ExtractedRequisition;
+    const data = (row.confirmedJson || row.extractedJson) as ExtractedRequisition;
     const reqId = data.requisition_id;
     
     if (reqId) {
@@ -279,8 +396,8 @@ export async function deduplicateRequisitions(
 
   // Add rows without requisition ID to unresolved
   const unresolved = rows
-    .filter((row) => !(row.extractedJson as ExtractedRequisition).requisition_id)
-    .map((row) => row.extractedJson as ExtractedRequisition);
+    .filter((row) => !((row.confirmedJson || row.extractedJson) as ExtractedRequisition).requisition_id)
+    .map((row) => (row.confirmedJson || row.extractedJson) as ExtractedRequisition);
 
   return [...merged, ...unresolved];
 }
@@ -336,6 +453,204 @@ function normalizeCustomerName(name: string | null): string | null {
 }
 
 /**
+ * Run Claude pay and fillability analysis on confirmed rows
+ */
+export async function runPayAnalysis(
+  batchId: string,
+  tenantId: string
+): Promise<void> {
+  await db
+    .update(requisitionAnalysisBatches)
+    .set({ status: "analyzing" })
+    .where(eq(requisitionAnalysisBatches.id, batchId));
+
+  const rows = await db
+    .select()
+    .from(requisitionSourceRows)
+    .where(
+      and(
+        eq(requisitionSourceRows.batchId, batchId),
+        eq(requisitionSourceRows.tenantId, tenantId),
+        eq(requisitionSourceRows.excluded, false)
+      )
+    );
+
+  const jobs = rows
+    .map((row) => {
+      const data = (row.confirmedJson || row.extractedJson) as ExtractedRequisition;
+      return {
+        requisition_id: data.requisition_id || "",
+        job_title: data.job_title,
+        customer: data.customer,
+        location: data.location,
+        duration: data.duration,
+        c2c_bill_rate: data.c2c_bill_rate,
+        position_type: data.position_type,
+        remote_or_onsite: data.remote_or_onsite,
+        submissions: data.submissions,
+      };
+    })
+    .filter((j) => j.requisition_id);
+
+  if (jobs.length === 0) {
+    return;
+  }
+
+  try {
+    const provider = createRequisitionIntelligenceService();
+    const analysis = await provider.estimatePayAndFillability({
+      jobs,
+      promptVersion: "v1.0",
+    });
+
+    const analysisByReqId = new Map(analysis.jobs.map((j) => [j.requisition_id, j]));
+
+    for (const row of rows) {
+      const data = (row.confirmedJson || row.extractedJson) as ExtractedRequisition;
+      if (!data.requisition_id) continue;
+      const pay = analysisByReqId.get(data.requisition_id);
+      if (!pay) continue;
+
+      const enriched = {
+        ...data,
+        recommended_w2_pay_min: pay.recommended_w2_pay_min,
+        recommended_w2_pay_max: pay.recommended_w2_pay_max,
+        pay_estimate_reason: pay.pay_estimate_reason,
+        market_rate_warning: pay.market_rate_warning,
+        fillability_score: pay.fillability_score,
+        fillability_label: pay.fillability_label,
+        fillability_reason: pay.fillability_reason,
+        suggested_risk_classification: pay.suggested_risk_classification,
+      };
+
+      await db
+        .update(requisitionSourceRows)
+        .set({ confirmedJson: enriched })
+        .where(eq(requisitionSourceRows.id, row.id));
+    }
+  } catch (err) {
+    console.error("Pay analysis failed, using bill-rate estimates:", err);
+    for (const row of rows) {
+      const data = (row.confirmedJson || row.extractedJson) as ExtractedRequisition;
+      if (!data.requisition_id || !data.c2c_bill_rate) continue;
+      const effectiveRate = data.c2c_bill_rate * 0.98;
+      const payMid = Math.round(effectiveRate * 0.55);
+      const enriched = {
+        ...data,
+        recommended_w2_pay_min: payMid - 1,
+        recommended_w2_pay_max: payMid + 1,
+        pay_estimate_reason: "Estimated from bill rate (Claude unavailable)",
+        fillability_score: 70,
+        fillability_label: "Moderate" as const,
+      };
+      await db
+        .update(requisitionSourceRows)
+        .set({ confirmedJson: enriched })
+        .where(eq(requisitionSourceRows.id, row.id));
+    }
+  }
+}
+
+/**
+ * Get rows for review (uses confirmedJson if set, else extractedJson)
+ */
+export async function getReviewRows(batchId: string, tenantId: string) {
+  const rows = await db
+    .select({
+      row: requisitionSourceRows,
+      file: requisitionSourceFiles,
+    })
+    .from(requisitionSourceRows)
+    .leftJoin(
+      requisitionSourceFiles,
+      eq(requisitionSourceRows.sourceFileId, requisitionSourceFiles.id)
+    )
+    .where(
+      and(
+        eq(requisitionSourceRows.batchId, batchId),
+        eq(requisitionSourceRows.tenantId, tenantId)
+      )
+    );
+
+  return rows.map(({ row, file }) => ({
+    id: row.id,
+    excluded: row.excluded,
+    sourceFilename: file?.originalFilename || "",
+    sheetName: row.sheetName,
+    rowNumber: row.rowNumber,
+    data: (row.confirmedJson || row.extractedJson) as ExtractedRequisition,
+    sourceConfidence: row.sourceConfidence,
+    dataQualityNotes: (row.dataQualityNotes as string[]) || [],
+    manuallyEdited: row.manuallyEdited,
+  }));
+}
+
+/**
+ * Update a source row during review
+ */
+export async function updateSourceRow(
+  rowId: string,
+  tenantId: string,
+  updates: Partial<ExtractedRequisition> & { excluded?: boolean }
+) {
+  const [existing] = await db
+    .select()
+    .from(requisitionSourceRows)
+    .where(
+      and(
+        eq(requisitionSourceRows.id, rowId),
+        eq(requisitionSourceRows.tenantId, tenantId)
+      )
+    );
+
+  if (!existing) throw new Error("Row not found");
+
+  const current = (existing.confirmedJson || existing.extractedJson) as ExtractedRequisition;
+  const { excluded, ...fieldUpdates } = updates;
+  const merged = { ...current, ...fieldUpdates };
+
+  await db
+    .update(requisitionSourceRows)
+    .set({
+      confirmedJson: merged,
+      excluded: excluded ?? existing.excluded,
+      manuallyEdited: true,
+      editedAt: new Date(),
+    })
+    .where(eq(requisitionSourceRows.id, rowId));
+}
+
+/**
+ * Confirm all non-excluded rows before analysis
+ */
+export async function confirmReviewRows(batchId: string, tenantId: string) {
+  const rows = await db
+    .select()
+    .from(requisitionSourceRows)
+    .where(
+      and(
+        eq(requisitionSourceRows.batchId, batchId),
+        eq(requisitionSourceRows.tenantId, tenantId),
+        eq(requisitionSourceRows.excluded, false)
+      )
+    );
+
+  for (const row of rows) {
+    if (!row.confirmedJson) {
+      await db
+        .update(requisitionSourceRows)
+        .set({ confirmedJson: row.extractedJson })
+        .where(eq(requisitionSourceRows.id, row.id));
+    }
+  }
+
+  await db
+    .update(requisitionAnalysisBatches)
+    .set({ status: "reviewing" })
+    .where(eq(requisitionAnalysisBatches.id, batchId));
+}
+
+/**
  * Finalize batch and upsert requisitions
  */
 export async function finalizeBatch(
@@ -354,14 +669,13 @@ export async function finalizeBatch(
   // Get deduplicated rows
   const rows = await deduplicateRequisitions(batchId, tenantId);
 
-  // Get MSP program config
   const [program] = await db
     .select()
-    .from(require("@/db/schema").mspPrograms)
+    .from(mspPrograms)
     .where(
       and(
-        eq(require("@/db/schema").mspPrograms.id, mspProgramId),
-        eq(require("@/db/schema").mspPrograms.tenantId, tenantId)
+        eq(mspPrograms.id, mspProgramId),
+        eq(mspPrograms.tenantId, tenantId)
       )
     );
 
