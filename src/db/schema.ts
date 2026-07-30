@@ -45,6 +45,24 @@ export const payScenarioEnum = pgEnum("pay_scenario", [
   "custom",
 ]);
 
+export const payRangeFitEnum = pgEnum("pay_range_fit", [
+  "Strong Fit",
+  "Workable",
+  "Tight",
+  "Below Market",
+  "Requires Review",
+  "Unavailable",
+]);
+
+export const duplicateStatusEnum = pgEnum("duplicate_status", [
+  "New",
+  "Duplicate in Current Import",
+  "Already Exists",
+  "Existing Record Updated",
+  "Possible Duplicate",
+  "Conflict Requires Review",
+]);
+
 export const recruitingStatusEnum = pgEnum("recruiting_status", [
   "Not Reviewed",
   "Reviewing",
@@ -205,11 +223,18 @@ export const requisitionSourceRows = pgTable("requisition_source_rows", {
   manuallyEdited: boolean("manually_edited").notNull().default(false),
   editedBy: uuid("edited_by").references(() => users.id),
   editedAt: timestamp("edited_at", { withTimezone: true }),
+  duplicateStatus: duplicateStatusEnum("duplicate_status").default("New"),
+  matchedExistingRequisitionId: uuid("matched_existing_requisition_id").references(
+    () => requisitions.id
+  ),
+  duplicateMatchReason: text("duplicate_match_reason"),
+  duplicateCheckedAt: timestamp("duplicate_checked_at", { withTimezone: true }),
   createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
 }, (table) => [
   index("source_rows_batch_idx").on(table.batchId),
   index("source_rows_file_idx").on(table.sourceFileId),
   index("source_rows_record_key_idx").on(table.sourceRecordKey),
+  index("source_rows_duplicate_status_idx").on(table.duplicateStatus),
 ]);
 
 // Requisitions table (authoritative records after deduplication)
@@ -287,6 +312,9 @@ export const requisitionSnapshots = pgTable("requisition_snapshots", {
   selectedPayRate: decimal("selected_pay_rate", { precision: 10, scale: 2 }),
   payScenario: payScenarioEnum("pay_scenario").default("midpoint"),
   payEstimateReason: text("pay_estimate_reason"),
+  payRangeConfidence: sourceConfidenceEnum("pay_range_confidence"),
+  payRangeFit: payRangeFitEnum("pay_range_fit"),
+  payOverrideReason: text("pay_override_reason"),
   marketRateWarning: text("market_rate_warning"),
 
   // Financial snapshot
@@ -335,6 +363,9 @@ export const requisitionAnalysisResults = pgTable("requisition_analysis_results"
   selectedPayRate: decimal("selected_pay_rate", { precision: 10, scale: 2 }),
   payScenario: payScenarioEnum("pay_scenario").default("midpoint"),
   payEstimateReason: text("pay_estimate_reason"),
+  payRangeConfidence: sourceConfidenceEnum("pay_range_confidence"),
+  payRangeFit: payRangeFitEnum("pay_range_fit"),
+  payOverrideReason: text("pay_override_reason"),
   marketRateWarning: text("market_rate_warning"),
 
   // Financials
@@ -374,6 +405,7 @@ export const requisitionAnalysisResults = pgTable("requisition_analysis_results"
   index("results_rank_idx").on(table.rank),
   index("results_final_recommendation_idx").on(table.finalRecommendation),
   index("results_tenant_opportunity_idx").on(table.tenantId, table.opportunityScore),
+  index("results_pay_range_fit_idx").on(table.payRangeFit),
 ]);
 
 // Requisition Overrides table

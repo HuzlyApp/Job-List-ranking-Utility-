@@ -3,22 +3,22 @@
 import { CheckIcon, ArrowRightIcon, RotateCcwIcon, AlertTriangleIcon } from "@/components/ui/icons";
 
 interface ImportCompletionSummaryProps {
-  sourceRows: number;
-  uniqueRequisitions: number;
+  newRecordsCreated: number;
+  existingRecordsUpdated: number;
   duplicatesConsolidated: number;
-  analysesCompleted: number;
-  recordsNeedingFollowUp: number;
+  payRangesGenerated: number;
+  recordsNeedingReview: number;
   onViewResults: () => void;
   onReviewIssues?: () => void;
   onNewImport: () => void;
 }
 
 export function ImportCompletionSummary({
-  sourceRows,
-  uniqueRequisitions,
+  newRecordsCreated,
+  existingRecordsUpdated,
   duplicatesConsolidated,
-  analysesCompleted,
-  recordsNeedingFollowUp,
+  payRangesGenerated,
+  recordsNeedingReview,
   onViewResults,
   onReviewIssues,
   onNewImport,
@@ -41,14 +41,14 @@ export function ImportCompletionSummary({
       {/* Summary Stats */}
       <div className="grid grid-cols-2 md:grid-cols-3 gap-4 mb-6">
         <StatCard
-          value={sourceRows}
-          label="Source Rows"
-          accent="neutral"
+          value={newRecordsCreated}
+          label="New Requisitions"
+          accent="success"
         />
         <StatCard
-          value={uniqueRequisitions}
-          label="Unique Requisitions"
-          accent="success"
+          value={existingRecordsUpdated}
+          label="Existing Records Updated"
+          accent={existingRecordsUpdated > 0 ? "success" : "neutral"}
         />
         <StatCard
           value={duplicatesConsolidated}
@@ -56,25 +56,25 @@ export function ImportCompletionSummary({
           accent={duplicatesConsolidated > 0 ? "warning" : "neutral"}
         />
         <StatCard
-          value={analysesCompleted}
-          label="Analyses Completed"
+          value={payRangesGenerated}
+          label="Pay Ranges Generated"
           accent="success"
         />
         <StatCard
-          value={recordsNeedingFollowUp}
-          label="Need Follow-up"
-          accent={recordsNeedingFollowUp > 0 ? "warning" : "neutral"}
+          value={recordsNeedingReview}
+          label="Records Needing Review"
+          accent={recordsNeedingReview > 0 ? "warning" : "neutral"}
         />
       </div>
 
       {/* Issues Warning */}
-      {recordsNeedingFollowUp > 0 && (
+      {recordsNeedingReview > 0 && (
         <div className="mb-6 p-4 bg-amber-50 border border-amber-200 rounded-lg">
           <div className="flex items-start gap-3">
             <AlertTriangleIcon className="w-5 h-5 text-amber-600 flex-shrink-0 mt-0.5" />
             <div>
               <p className="text-sm font-bold text-amber-800">
-                {recordsNeedingFollowUp} records require follow-up
+                {recordsNeedingReview} records require follow-up
               </p>
               <p className="text-xs font-medium text-amber-700 mt-1">
                 These records were saved but may need manual review or correction.
@@ -93,7 +93,7 @@ export function ImportCompletionSummary({
           View Ranked Results
           <ArrowRightIcon className="w-4 h-4" />
         </button>
-        {recordsNeedingFollowUp > 0 && onReviewIssues && (
+        {recordsNeedingReview > 0 && onReviewIssues && (
           <button
             onClick={onReviewIssues}
             className="inline-flex items-center gap-2 px-6 py-2 text-sm font-bold text-amber-700 bg-amber-50 border border-amber-200 rounded-lg hover:bg-amber-100 transition-colors"

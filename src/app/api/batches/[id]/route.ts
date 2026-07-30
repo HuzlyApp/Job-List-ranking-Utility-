@@ -75,8 +75,8 @@ export async function POST(
     }
 
     if (validated.action === "get_review") {
-      const rows = await getReviewRows(batchId, validated.tenantId);
-      return NextResponse.json({ rows });
+      const review = await getReviewRows(batchId, validated.tenantId);
+      return NextResponse.json(review);
     }
 
     if (validated.action === "confirm_review") {

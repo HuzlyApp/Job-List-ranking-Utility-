@@ -7,9 +7,13 @@ import {
   BuildingIcon,
   MapPinIcon,
   ClockIcon,
-  DollarSignIcon,
-  UsersIcon,
 } from "@/components/ui/icons";
+import {
+  formatPayRange,
+  formatPayRate,
+  payRangeFitBadgeClass,
+  type PayRangeFit,
+} from "@/lib/pay-range";
 
 interface RequisitionDetail {
   requisition: {
@@ -46,6 +50,9 @@ interface RequisitionDetail {
     selectedPayRate: string | null;
     fillabilityScore: number | null;
     fillabilityLabel: string | null;
+    payRangeFit?: string | null;
+    payEstimateReason?: string | null;
+    marketRateWarning?: string | null;
     requiresManualReview: boolean;
   } | null;
 }
@@ -118,40 +125,52 @@ export function DetailDrawer({ requisition, onClose, isOpen }: DetailDrawerProps
 
         {/* Content */}
         <div className="overflow-y-auto h-[calc(100vh-80px)]">
-          {/* Score & Recommendation Banner */}
+          {/* Recruiting Summary */}
           {analysis && (
-            <div className="px-6 py-4 bg-gradient-to-r from-emerald-50 to-blue-50 border-b border-slate-100">
-              <div className="flex items-center justify-between">
-                <div>
-                  <p className="text-sm text-slate-500">Opportunity Score</p>
-                  <p className="text-3xl font-bold text-emerald-600 tabular-nums">
-                    {analysis.opportunityScore || "-"}
-                  </p>
-                </div>
-                <div className="text-right">
-                  <p className="text-sm text-slate-500">Rank</p>
-                  <p className="text-2xl font-bold text-slate-900 tabular-nums">
-                    #{analysis.rank || "-"}
-                  </p>
-                </div>
-              </div>
-              <div className="mt-3">
-                <span className="inline-flex items-center px-3 py-1.5 text-sm font-medium bg-white border border-emerald-200 text-emerald-700 rounded-full shadow-sm">
-                  {analysis.finalRecommendation || "No Recommendation"}
-                </span>
-                {analysis.requiresManualReview && (
-                  <span className="ml-2 inline-flex items-center px-3 py-1.5 text-sm font-medium bg-red-100 text-red-700 rounded-full">
-                    Requires Manual Review
+            <div className="px-6 py-5 bg-gradient-to-r from-emerald-50 to-blue-50 border-b border-slate-100">
+              <h3 className="text-sm font-semibold text-slate-900 uppercase tracking-wider mb-4">
+                Recruiting Summary
+              </h3>
+              <div className="space-y-3">
+                <SummaryRow label="Recommendation" value={analysis.finalRecommendation || "No Recommendation"} />
+                <SummaryRow
+                  label="Recommended Pay Range"
+                  value={formatPayRange(analysis.recommendedPayMin, analysis.recommendedPayMax)}
+                  emphasize
+                />
+                <SummaryRow label="Target Pay Rate" value={formatPayRate(analysis.selectedPayRate)} />
+                <div className="flex items-center justify-between gap-4">
+                  <span className="text-sm text-slate-600">Pay Range Fit</span>
+                  <span className={`inline-flex items-center px-2.5 py-1 text-xs font-bold rounded-full border ${payRangeFitBadgeClass(analysis.payRangeFit as PayRangeFit | null | undefined)}`}>
+                    {analysis.payRangeFit || "Unavailable"}
                   </span>
-                )}
+                </div>
+                <SummaryRow
+                  label="Fillability"
+                  value={`${analysis.fillabilityLabel || "—"}${analysis.fillabilityScore != null ? ` (${analysis.fillabilityScore}/100)` : ""}`}
+                />
+                <SummaryRow
+                  label="Submissions"
+                  value={`${requisition.requisition.submissionCount ?? "—"}${requisition.requisition.activeSubmissionCount ? ` (${requisition.requisition.activeSubmissionCount} active)` : ""}`}
+                />
+                <div className="flex flex-wrap gap-2 pt-1">
+                  <span className="inline-flex items-center px-2.5 py-1 text-xs font-bold bg-white border border-emerald-200 text-emerald-700 rounded-full">
+                    Score {analysis.opportunityScore ?? "—"} · Rank #{analysis.rank ?? "—"}
+                  </span>
+                  {analysis.requiresManualReview && (
+                    <span className="inline-flex items-center px-2.5 py-1 text-xs font-bold bg-red-100 text-red-700 rounded-full">
+                      Requires Manual Review
+                    </span>
+                  )}
+                </div>
               </div>
             </div>
           )}
 
-          {/* Job Details */}
+          {/* Job Information */}
           <div className="px-6 py-5 border-b border-slate-100">
             <h3 className="text-sm font-semibold text-slate-900 uppercase tracking-wider mb-4">
-              Job Details
+              Job Information
             </h3>
             <div className="space-y-4">
               <div>
@@ -195,30 +214,43 @@ export function DetailDrawer({ requisition, onClose, isOpen }: DetailDrawerProps
                     </p>
                   </div>
                 </div>
-                <div className="flex items-start gap-2">
-                  <UsersIcon className="w-4 h-4 text-slate-400 mt-0.5" />
-                  <div>
-                    <p className="text-sm text-slate-500">Submissions</p>
-                    <p className="text-sm font-medium text-slate-900">
-                      {requisition.requisition.submissionCount ?? "-"}
-                      {requisition.requisition.activeSubmissionCount ? (
-                        <span className="text-xs text-slate-500 ml-1">
-                          ({requisition.requisition.activeSubmissionCount} active)
-                        </span>
-                      ) : null}
-                    </p>
-                  </div>
-                </div>
+                <SummaryRow label="Status" value={requisition.requisition.status || "—"} />
               </div>
             </div>
           </div>
 
-          {/* Financial Breakdown */}
+          {/* Duplicate / History */}
+          <div className="px-6 py-5 border-b border-slate-100">
+            <h3 className="text-sm font-semibold text-slate-900 uppercase tracking-wider mb-4">
+              Duplicate / History
+            </h3>
+            <div className="space-y-3">
+              {requisition.requisition.isNewToday && (
+                <span className="inline-flex items-center px-2.5 py-1 text-xs font-bold bg-emerald-100 text-emerald-800 rounded-full">
+                  New Today
+                </span>
+              )}
+              <SummaryRow
+                label="First Seen"
+                value={new Date(requisition.requisition.firstSeenAt).toLocaleDateString()}
+              />
+              <SummaryRow
+                label="Last Seen"
+                value={new Date(requisition.requisition.lastSeenAt).toLocaleDateString()}
+              />
+              <SummaryRow label="Source Confidence" value={requisition.requisition.sourceConfidence} />
+            </div>
+          </div>
+
+          {/* Secondary Financial Details */}
           {analysis && (
             <div className="px-6 py-5 border-b border-slate-100">
               <h3 className="text-sm font-semibold text-slate-900 uppercase tracking-wider mb-4">
-                Financial Breakdown
+                Secondary Financial Details
               </h3>
+              <p className="text-xs text-slate-500 mb-4">
+                Margin and profit context shown after recruiting pay guidance.
+              </p>
               <div className="grid grid-cols-2 gap-4">
                 <div className="p-3 bg-slate-50 rounded-lg">
                   <p className="text-xs text-slate-500">Bill Rate</p>
@@ -230,12 +262,6 @@ export function DetailDrawer({ requisition, onClose, isOpen }: DetailDrawerProps
                   <p className="text-xs text-slate-500">Effective Rate</p>
                   <p className="text-lg font-semibold text-slate-900 tabular-nums">
                     {formatCurrency(analysis.effectiveVendorRate)}
-                  </p>
-                </div>
-                <div className="p-3 bg-slate-50 rounded-lg">
-                  <p className="text-xs text-slate-500">Pay Range</p>
-                  <p className="text-sm font-semibold text-slate-900 tabular-nums">
-                    {formatCurrency(analysis.recommendedPayMin)} - {formatCurrency(analysis.recommendedPayMax)}
                   </p>
                 </div>
                 <div className={`p-3 rounded-lg ${parseFloat(analysis.estimatedProfitPerHour || "0") < 0 ? "bg-red-50" : "bg-emerald-50"}`}>
@@ -268,64 +294,53 @@ export function DetailDrawer({ requisition, onClose, isOpen }: DetailDrawerProps
             </div>
           )}
 
-          {/* Fillability */}
+          {/* Claude Analysis */}
           {analysis && (
-            <div className="px-6 py-5 border-b border-slate-100">
+            <div className="px-6 py-5">
               <h3 className="text-sm font-semibold text-slate-900 uppercase tracking-wider mb-4">
-                Fillability Assessment
+                Claude Analysis
               </h3>
-              <div className="flex items-center gap-4">
-                <div className="flex-1">
-                  <div className="flex items-center justify-between mb-2">
-                    <span className="text-sm text-slate-500">Score</span>
-                    <span className="text-sm font-semibold text-slate-900">
-                      {analysis.fillabilityScore || "-"}/100
-                    </span>
-                  </div>
-                  <div className="h-2 bg-slate-100 rounded-full overflow-hidden">
-                    <div 
-                      className="h-full bg-emerald-500 rounded-full transition-all"
-                      style={{ width: `${analysis.fillabilityScore || 0}%` }}
-                    />
-                  </div>
+              <div className="space-y-4 text-sm">
+                <div>
+                  <p className="font-semibold text-slate-700">Pay estimate rationale</p>
+                  <p className="mt-1 text-slate-600">
+                    {analysis.payEstimateReason || "No pay estimate rationale was provided."}
+                  </p>
                 </div>
-                <span className="px-3 py-1 text-sm font-medium bg-slate-100 text-slate-700 rounded-full">
-                  {analysis.fillabilityLabel || "-"}
-                </span>
+                {analysis.marketRateWarning && (
+                  <div className="p-3 bg-amber-50 border border-amber-200 rounded-lg">
+                    <p className="font-semibold text-amber-900">Market rate warning</p>
+                    <p className="mt-1 text-amber-800">{analysis.marketRateWarning}</p>
+                  </div>
+                )}
               </div>
             </div>
           )}
-
-          {/* Metadata */}
-          <div className="px-6 py-5">
-            <h3 className="text-sm font-semibold text-slate-900 uppercase tracking-wider mb-4">
-              Metadata
-            </h3>
-            <div className="space-y-2 text-sm">
-              <div className="flex justify-between">
-                <span className="text-slate-500">Status</span>
-                <span className="font-medium text-slate-900">{requisition.requisition.status || "-"}</span>
-              </div>
-              <div className="flex justify-between">
-                <span className="text-slate-500">Confidence</span>
-                <span className="font-medium text-slate-900">{requisition.requisition.sourceConfidence}</span>
-              </div>
-              <div className="flex justify-between">
-                <span className="text-slate-500">First Seen</span>
-                <span className="font-medium text-slate-900">
-                  {new Date(requisition.requisition.firstSeenAt).toLocaleDateString()}
-                </span>
-              </div>
-              <div className="flex justify-between">
-                <span className="text-slate-500">Last Updated</span>
-                <span className="font-medium text-slate-900">
-                  {new Date(requisition.requisition.lastSeenAt).toLocaleDateString()}
-                </span>
-              </div>
-            </div>
-          </div>
         </div>
       </aside>
     </>
+  );
+}
+
+function SummaryRow({
+  label,
+  value,
+  emphasize = false,
+}: {
+  label: string;
+  value: string;
+  emphasize?: boolean;
+}) {
+  return (
+    <div className="flex items-start justify-between gap-4">
+      <span className="text-sm text-slate-600">{label}</span>
+      <span
+        className={`text-right text-sm font-semibold tabular-nums ${
+          emphasize ? "text-emerald-700" : "text-slate-900"
+        }`}
+      >
+        {value}
+      </span>
+    </div>
   );
 }

@@ -1,14 +1,18 @@
 "use client";
 
-import { useState } from "react";
-import Link from "next/link";
+import { useMemo, useState } from "react";
 import {
   ArrowUpDownIcon,
   ChevronLeftIcon,
   ChevronRightIcon,
   MoreHorizontalIcon,
-  ExternalLinkIcon,
 } from "@/components/ui/icons";
+import {
+  formatPayRange,
+  formatPayRate,
+  payRangeFitBadgeClass,
+  type PayRangeFit,
+} from "@/lib/pay-range";
 
 interface RequisitionWithAnalysis {
   requisition: {
@@ -42,6 +46,7 @@ interface RequisitionWithAnalysis {
     recommendedPayMin: string | null;
     recommendedPayMax: string | null;
     selectedPayRate: string | null;
+    payRangeFit?: string | null;
     fillabilityScore: number | null;
     fillabilityLabel: string | null;
     requiresManualReview: boolean;
@@ -65,13 +70,23 @@ interface RequisitionTableProps {
   isLoading?: boolean;
 }
 
-type SortField = "rank" | "opportunityScore" | "customer" | "profit" | "margin" | "billRate";
+type SortField =
+  | "rank"
+  | "opportunityScore"
+  | "customer"
+  | "profit"
+  | "margin"
+  | "billRate"
+  | "recommendedPay"
+  | "targetPay";
 type SortDirection = "asc" | "desc";
 
 export function RequisitionTable({ data, onPageChange, onRowClick, isLoading }: RequisitionTableProps) {
   const [sortField, setSortField] = useState<SortField>("rank");
   const [sortDirection, setSortDirection] = useState<SortDirection>("asc");
   const [selectedRows, setSelectedRows] = useState<Set<string>>(new Set());
+  const [showProfitPerHour, setShowProfitPerHour] = useState(false);
+  const [showMargin, setShowMargin] = useState(false);
 
   const handleSort = (field: SortField) => {
     if (sortField === field) {
@@ -132,6 +147,45 @@ export function RequisitionTable({ data, onPageChange, onRowClick, isLoading }: 
     return "bg-red-100 text-red-700";
   };
 
+  const sortedRequisitions = useMemo(() => {
+    if (!data) return [];
+
+    const getSortValue = (item: RequisitionWithAnalysis): string | number | null => {
+      const { requisition, analysis } = item;
+      switch (sortField) {
+        case "rank":
+          return analysis?.rank ?? null;
+        case "opportunityScore":
+          return analysis?.opportunityScore ?? null;
+        case "customer":
+          return requisition.normalizedCustomerName || requisition.sourceCustomerName;
+        case "profit":
+          return analysis?.estimatedProfitPerHour ? Number(analysis.estimatedProfitPerHour) : null;
+        case "margin":
+          return analysis?.netMarginPercent ? Number(analysis.netMarginPercent) : null;
+        case "billRate":
+          return requisition.displayedVendorRate ? Number(requisition.displayedVendorRate) : null;
+        case "recommendedPay":
+          return analysis?.recommendedPayMin ? Number(analysis.recommendedPayMin) : null;
+        case "targetPay":
+          return analysis?.selectedPayRate ? Number(analysis.selectedPayRate) : null;
+      }
+    };
+
+    return [...data.requisitions].sort((a, b) => {
+      const aValue = getSortValue(a);
+      const bValue = getSortValue(b);
+      if (aValue === null) return bValue === null ? 0 : 1;
+      if (bValue === null) return -1;
+
+      const comparison =
+        typeof aValue === "string" && typeof bValue === "string"
+          ? aValue.localeCompare(bValue)
+          : Number(aValue) - Number(bValue);
+      return sortDirection === "asc" ? comparison : -comparison;
+    });
+  }, [data, sortDirection, sortField]);
+
   if (isLoading) {
     return (
       <div className="bg-white border border-slate-200 rounded-xl shadow-sm overflow-hidden">
@@ -151,6 +205,30 @@ export function RequisitionTable({ data, onPageChange, onRowClick, isLoading }: 
 
   return (
     <div className="bg-white border border-slate-200 rounded-xl shadow-sm overflow-hidden">
+      <div className="flex flex-wrap items-center justify-end gap-4 px-4 py-2.5 border-b border-slate-200 bg-slate-50">
+        <span className="text-xs font-bold text-slate-700 uppercase tracking-wider">
+          Optional columns
+        </span>
+        <label className="flex items-center gap-2 text-sm font-bold text-slate-700 cursor-pointer">
+          <input
+            type="checkbox"
+            checked={showProfitPerHour}
+            onChange={(event) => setShowProfitPerHour(event.target.checked)}
+            className="w-4 h-4 text-emerald-600 border-slate-400 rounded focus:ring-emerald-500"
+          />
+          Profit/Hr
+        </label>
+        <label className="flex items-center gap-2 text-sm font-bold text-slate-700 cursor-pointer">
+          <input
+            type="checkbox"
+            checked={showMargin}
+            onChange={(event) => setShowMargin(event.target.checked)}
+            className="w-4 h-4 text-emerald-600 border-slate-400 rounded focus:ring-emerald-500"
+          />
+          Margin
+        </label>
+      </div>
+
       {/* Table */}
       <div className="overflow-x-auto">
         <table className="w-full">
@@ -173,20 +251,11 @@ export function RequisitionTable({ data, onPageChange, onRowClick, isLoading }: 
                   <ArrowUpDownIcon className="w-3.5 h-3.5 text-slate-600" />
                 </div>
               </th>
-              <th 
-                className="px-3 py-3 text-left text-xs font-bold text-slate-800 uppercase tracking-wider cursor-pointer hover:bg-slate-200"
-                onClick={() => handleSort("opportunityScore")}
-              >
-                <div className="flex items-center gap-1">
-                  Score
-                  <ArrowUpDownIcon className="w-3.5 h-3.5 text-slate-600" />
-                </div>
-              </th>
               <th className="px-3 py-3 text-left text-xs font-bold text-slate-800 uppercase tracking-wider">
                 Recommendation
               </th>
               <th className="px-3 py-3 text-left text-xs font-bold text-slate-800 uppercase tracking-wider">
-                Req ID
+                Requisition ID
               </th>
               <th 
                 className="px-3 py-3 text-left text-xs font-bold text-slate-800 uppercase tracking-wider cursor-pointer hover:bg-slate-200"
@@ -204,40 +273,105 @@ export function RequisitionTable({ data, onPageChange, onRowClick, isLoading }: 
                 Location
               </th>
               <th className="px-3 py-3 text-left text-xs font-bold text-slate-800 uppercase tracking-wider">
-                Sub
+                Work Arrangement
+              </th>
+              <th 
+                className="px-3 py-3 text-left text-xs font-bold text-slate-800 uppercase tracking-wider cursor-pointer hover:bg-slate-200"
+                onClick={() => handleSort("billRate")}
+              >
+                <div className="flex items-center gap-1">
+                  Bill Rate
+                  <ArrowUpDownIcon className="w-3.5 h-3.5 text-slate-600" />
+                </div>
+              </th>
+              <th 
+                className="px-3 py-3 text-left text-xs font-bold text-slate-800 uppercase tracking-wider cursor-pointer hover:bg-slate-200"
+                onClick={() => handleSort("recommendedPay")}
+              >
+                <div className="flex items-center gap-1">
+                  Recommended Pay Range
+                  <ArrowUpDownIcon className="w-3.5 h-3.5 text-slate-600" />
+                </div>
+              </th>
+              <th
+                className="px-3 py-3 text-left text-xs font-bold text-slate-800 uppercase tracking-wider cursor-pointer hover:bg-slate-200"
+                onClick={() => handleSort("targetPay")}
+              >
+                <div className="flex items-center gap-1">
+                  Target Pay Rate
+                  <ArrowUpDownIcon className="w-3.5 h-3.5 text-slate-600" />
+                </div>
               </th>
               <th className="px-3 py-3 text-left text-xs font-bold text-slate-800 uppercase tracking-wider">
-                Bill Rate
+                Pay Range Fit
               </th>
-              <th 
-                className="px-3 py-3 text-left text-xs font-bold text-slate-800 uppercase tracking-wider cursor-pointer hover:bg-slate-200"
-                onClick={() => handleSort("profit")}
-              >
-                <div className="flex items-center gap-1">
-                  Profit/Hr
-                  <ArrowUpDownIcon className="w-3.5 h-3.5 text-slate-600" />
-                </div>
+              <th className="px-3 py-3 text-left text-xs font-bold text-slate-800 uppercase tracking-wider">
+                Submissions
               </th>
-              <th 
-                className="px-3 py-3 text-left text-xs font-bold text-slate-800 uppercase tracking-wider cursor-pointer hover:bg-slate-200"
-                onClick={() => handleSort("margin")}
-              >
-                <div className="flex items-center gap-1">
-                  Margin
-                  <ArrowUpDownIcon className="w-3.5 h-3.5 text-slate-600" />
-                </div>
-              </th>
+              {showProfitPerHour && (
+                <th
+                  className="px-3 py-3 text-left text-xs font-bold text-slate-800 uppercase tracking-wider cursor-pointer hover:bg-slate-200"
+                  onClick={() => handleSort("profit")}
+                >
+                  <div className="flex items-center gap-1">
+                    Profit/Hr
+                    <ArrowUpDownIcon className="w-3.5 h-3.5 text-slate-600" />
+                  </div>
+                </th>
+              )}
+              {showMargin && (
+                <th
+                  className="px-3 py-3 text-left text-xs font-bold text-slate-800 uppercase tracking-wider cursor-pointer hover:bg-slate-200"
+                  onClick={() => handleSort("margin")}
+                >
+                  <div className="flex items-center gap-1">
+                    Margin
+                    <ArrowUpDownIcon className="w-3.5 h-3.5 text-slate-600" />
+                  </div>
+                </th>
+              )}
               <th className="px-3 py-3 text-left text-xs font-bold text-slate-800 uppercase tracking-wider">
                 Fillability
               </th>
-              <th className="w-10 px-3 py-3" />
+              <th
+                className="px-3 py-3 text-left text-xs font-bold text-slate-800 uppercase tracking-wider cursor-pointer hover:bg-slate-200"
+                onClick={() => handleSort("opportunityScore")}
+              >
+                <div className="flex items-center gap-1">
+                  Opportunity Score
+                  <ArrowUpDownIcon className="w-3.5 h-3.5 text-slate-600" />
+                </div>
+              </th>
+              <th className="px-3 py-3 text-left text-xs font-bold text-slate-800 uppercase tracking-wider">
+                Status
+              </th>
+              <th className="px-3 py-3 text-left text-xs font-bold text-slate-800 uppercase tracking-wider">
+                Duplicate Status
+              </th>
+              <th className="px-3 py-3 text-left text-xs font-bold text-slate-800 uppercase tracking-wider">
+                Actions
+              </th>
             </tr>
           </thead>
           <tbody className="bg-white divide-y divide-slate-200">
-            {data.requisitions.map((item) => {
+            {sortedRequisitions.map((item) => {
               const req = item.requisition;
               const analysis = item.analysis;
               const isSelected = selectedRows.has(req.id);
+              const hasRecommendedPayRange =
+                analysis?.recommendedPayMin != null &&
+                analysis?.recommendedPayMax != null;
+              const recommendedPayRange = formatPayRange(
+                analysis?.recommendedPayMin,
+                analysis?.recommendedPayMax,
+                hasRecommendedPayRange
+                  ? "ready"
+                  : analysis?.requiresManualReview
+                    ? "requires_review"
+                    : "pending"
+              );
+              const payRangeFit =
+                (analysis?.payRangeFit as PayRangeFit | null | undefined) ?? null;
 
               return (
                 <tr
@@ -257,23 +391,6 @@ export function RequisitionTable({ data, onPageChange, onRowClick, isLoading }: 
                     <span className="font-bold text-slate-900 tabular-nums">
                       {analysis?.rank || "-"}
                     </span>
-                  </td>
-                  <td className="px-3 py-3 whitespace-nowrap">
-                    <div className="flex items-center gap-2">
-                      <span className={`inline-flex items-center px-2.5 py-1 text-xs font-bold rounded-full ${getScoreBadge(analysis?.opportunityScore)}`}>
-                        {analysis?.opportunityScore || "-"}
-                      </span>
-                      {req.isNewToday && (
-                        <span className="inline-flex items-center px-1.5 py-0.5 text-xs font-bold bg-emerald-100 text-emerald-800 rounded">
-                          New
-                        </span>
-                      )}
-                      {req.isNoLongerVisible && (
-                        <span className="inline-flex items-center px-1.5 py-0.5 text-xs font-bold bg-slate-200 text-slate-700 rounded">
-                          Hidden
-                        </span>
-                      )}
-                    </div>
                   </td>
                   <td className="px-3 py-3 whitespace-nowrap">
                     <span className={`inline-flex items-center px-2.5 py-1 text-xs font-bold rounded-full border ${getRecommendationBadge(analysis?.finalRecommendation)}`}>
@@ -304,39 +421,86 @@ export function RequisitionTable({ data, onPageChange, onRowClick, isLoading }: 
                     <span className="text-sm font-medium text-slate-700">
                       {req.location || "-"}
                     </span>
-                    {req.remoteOrOnsite && req.remoteOrOnsite !== "Unknown" && (
-                      <span className="block text-xs font-medium text-slate-600">
-                        {req.remoteOrOnsite}
-                      </span>
-                    )}
+                  </td>
+                  <td className="px-3 py-3 whitespace-nowrap">
+                    <span className="text-sm font-medium text-slate-700">
+                      {req.remoteOrOnsite && req.remoteOrOnsite !== "Unknown"
+                        ? req.remoteOrOnsite
+                        : "-"}
+                    </span>
+                  </td>
+                  <td className="px-3 py-3 whitespace-nowrap text-right">
+                    <span className="text-sm font-bold text-slate-800 tabular-nums">
+                      {formatPayRate(req.displayedVendorRate)}
+                    </span>
+                  </td>
+                  <td className="px-3 py-3 whitespace-nowrap">
+                    <span className="text-sm font-bold text-slate-800 tabular-nums">
+                      {recommendedPayRange}
+                    </span>
+                  </td>
+                  <td className="px-3 py-3 whitespace-nowrap">
+                    <span className="text-sm font-bold text-slate-800 tabular-nums">
+                      {formatPayRate(analysis?.selectedPayRate)}
+                    </span>
+                  </td>
+                  <td className="px-3 py-3 whitespace-nowrap">
+                    <span className={`inline-flex items-center px-2.5 py-1 text-xs font-bold rounded-full border ${payRangeFitBadgeClass(payRangeFit)}`}>
+                      {payRangeFit || "-"}
+                    </span>
                   </td>
                   <td className="px-3 py-3 whitespace-nowrap text-right">
                     <span className="text-sm font-bold text-slate-800 tabular-nums">
                       {req.submissionCount ?? "-"}
                     </span>
                   </td>
-                  <td className="px-3 py-3 whitespace-nowrap text-right">
-                    <span className="text-sm font-bold text-slate-800 tabular-nums">
-                      {formatCurrency(req.displayedVendorRate)}
-                    </span>
-                  </td>
-                  <td className="px-3 py-3 whitespace-nowrap text-right">
-                    <span className={`text-sm font-bold tabular-nums ${
-                      analysis?.estimatedProfitPerHour && parseFloat(analysis.estimatedProfitPerHour) < 0
-                        ? "text-red-700"
-                        : "text-emerald-700"
-                    }`}>
-                      {formatCurrency(analysis?.estimatedProfitPerHour)}
-                    </span>
-                  </td>
-                  <td className="px-3 py-3 whitespace-nowrap text-right">
-                    <span className="text-sm font-bold text-slate-800 tabular-nums">
-                      {formatPercent(analysis?.netMarginPercent)}
-                    </span>
-                  </td>
+                  {showProfitPerHour && (
+                    <td className="px-3 py-3 whitespace-nowrap text-right">
+                      <span className={`text-sm font-bold tabular-nums ${
+                        analysis?.estimatedProfitPerHour && parseFloat(analysis.estimatedProfitPerHour) < 0
+                          ? "text-red-700"
+                          : "text-emerald-700"
+                      }`}>
+                        {formatCurrency(analysis?.estimatedProfitPerHour)}
+                      </span>
+                    </td>
+                  )}
+                  {showMargin && (
+                    <td className="px-3 py-3 whitespace-nowrap text-right">
+                      <span className="text-sm font-bold text-slate-800 tabular-nums">
+                        {formatPercent(analysis?.netMarginPercent)}
+                      </span>
+                    </td>
+                  )}
                   <td className="px-3 py-3 whitespace-nowrap">
                     <span className="text-sm font-medium text-slate-700">
                       {analysis?.fillabilityLabel || "-"}
+                    </span>
+                  </td>
+                  <td className="px-3 py-3 whitespace-nowrap">
+                    <span className={`inline-flex items-center px-2.5 py-1 text-xs font-bold rounded-full ${getScoreBadge(analysis?.opportunityScore)}`}>
+                      {analysis?.opportunityScore ?? "-"}
+                    </span>
+                  </td>
+                  <td className="px-3 py-3 whitespace-nowrap">
+                    <div className="flex items-center gap-2">
+                      <span className="text-sm font-bold text-slate-800">
+                        {req.status || "-"}
+                      </span>
+                      {req.isNoLongerVisible && (
+                        <span className="inline-flex items-center px-1.5 py-0.5 text-xs font-bold bg-slate-200 text-slate-700 rounded">
+                          Hidden
+                        </span>
+                      )}
+                    </div>
+                  </td>
+                  <td className="px-3 py-3 whitespace-nowrap">
+                    <span className={`inline-flex items-center px-2 py-1 text-xs font-bold rounded-full ${
+                      req.isNewToday
+                        ? "bg-emerald-100 text-emerald-800"
+                        : "bg-slate-100 text-slate-700"
+                    }`}>
+                      {req.isNewToday ? "New" : "Existing"}
                     </span>
                   </td>
                   <td className="px-3 py-3 whitespace-nowrap">

@@ -96,6 +96,18 @@ interface ReviewRow {
   };
   sourceConfidence: string;
   dataQualityNotes: string[];
+  duplicateStatus?: string;
+  duplicateMatchReason?: string | null;
+  existingRecord?: Record<string, unknown> | null;
+}
+
+interface DuplicateSummary {
+  newRequisitions: number;
+  duplicatesInImport: number;
+  existingMatches: number;
+  possibleDuplicates: number;
+  conflicts: number;
+  missingRequisitionId: number;
 }
 
 type PageMode = "processing" | "preview" | "review" | "analyzing" | "complete" | "failed";
@@ -122,6 +134,7 @@ function BatchImportPageContent({ params }: { params: Promise<{ batchId: string 
   const [batchId, setBatchId] = useState<string>("");
   const [status, setStatus] = useState<BatchStatus | null>(null);
   const [reviewRows, setReviewRows] = useState<ReviewRow[]>([]);
+  const [duplicateSummary, setDuplicateSummary] = useState<DuplicateSummary | null>(null);
   const [mode, setMode] = useState<PageMode>("processing");
   const [error, setError] = useState<string | null>(null);
   const [analyzing, setAnalyzing] = useState(false);
@@ -133,6 +146,9 @@ function BatchImportPageContent({ params }: { params: Promise<{ batchId: string 
     analysesCompleted: number;
     analysesPending: number;
     requiresReview: number;
+    newRecordsCreated: number;
+    existingRecordsUpdated: number;
+    duplicatesConsolidated: number;
   } | null>(null);
 
   useEffect(() => {
@@ -190,6 +206,7 @@ function BatchImportPageContent({ params }: { params: Promise<{ batchId: string 
     if (res.ok) {
       const data = await res.json();
       setReviewRows(data.rows || []);
+      setDuplicateSummary(data.duplicateSummary || null);
     }
   }, [batchId, tenantId]);
 
@@ -451,6 +468,33 @@ function BatchImportPageContent({ params }: { params: Promise<{ batchId: string 
                 isConfirming={analyzing}
               />
 
+              {duplicateSummary && (
+                <div className="bg-white border border-slate-300 rounded-xl shadow-sm p-4">
+                  <h2 className="text-sm font-bold text-slate-900 mb-3">
+                    Import Summary
+                  </h2>
+                  <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-3">
+                    {[
+                      ["New", duplicateSummary.newRequisitions],
+                      ["Duplicates in Import", duplicateSummary.duplicatesInImport],
+                      ["Existing Matches", duplicateSummary.existingMatches],
+                      ["Possible", duplicateSummary.possibleDuplicates],
+                      ["Conflicts", duplicateSummary.conflicts],
+                      ["Missing IDs", duplicateSummary.missingRequisitionId],
+                    ].map(([label, value]) => (
+                      <div key={String(label)} className="p-3 bg-slate-50 border border-slate-200 rounded-lg">
+                        <p className="text-xl font-bold text-slate-900 tabular-nums">
+                          {Number(value).toLocaleString()}
+                        </p>
+                        <p className="mt-1 text-xs font-bold text-slate-600">
+                          {label}
+                        </p>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+
               {error && (
                 <div className="p-4 bg-red-50 border border-red-200 rounded-lg">
                   <p className="text-sm font-bold text-red-800">{error}</p>
@@ -497,11 +541,11 @@ function BatchImportPageContent({ params }: { params: Promise<{ batchId: string 
           {/* Complete State */}
           {mode === "complete" && completionSummary && (
             <ImportCompletionSummary
-              sourceRows={completionSummary.sourceRowCount ?? detectedCount}
-              uniqueRequisitions={completionSummary.uniqueRequisitionCount}
-              duplicatesConsolidated={Math.max(0, (completionSummary.sourceRowCount ?? detectedCount) - completionSummary.uniqueRequisitionCount)}
-              analysesCompleted={completionSummary.analysesCompleted}
-              recordsNeedingFollowUp={completionSummary.requiresReview}
+              newRecordsCreated={completionSummary.newRecordsCreated}
+              existingRecordsUpdated={completionSummary.existingRecordsUpdated}
+              duplicatesConsolidated={completionSummary.duplicatesConsolidated}
+              payRangesGenerated={completionSummary.analysesCompleted}
+              recordsNeedingReview={completionSummary.requiresReview}
               onViewResults={() => router.push("/?imported=1")}
               onReviewIssues={completionSummary.requiresReview > 0 ? () => setMode("review") : undefined}
               onNewImport={() => router.push("/requisitions/import")}

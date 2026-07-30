@@ -25,7 +25,6 @@ import {
   SparklesIcon,
   TargetIcon,
   AlertTriangleIcon,
-  EyeOffIcon,
   GaugeIcon,
   UploadIcon,
 } from "@/components/ui/icons";
@@ -64,6 +63,9 @@ interface RequisitionWithAnalysis {
     recommendedPayMin: string | null;
     recommendedPayMax: string | null;
     selectedPayRate: string | null;
+    payRangeFit?: string | null;
+    payEstimateReason?: string | null;
+    marketRateWarning?: string | null;
     fillabilityScore: number | null;
     fillabilityLabel: string | null;
     requiresManualReview: boolean;
@@ -85,6 +87,9 @@ interface DashboardData {
     negativeProfit: number;
     noLongerVisible: number;
     averageOpportunityScore: number | null;
+    strongPayRangeFit: number;
+    belowMarket: number;
+    averageTargetPay: number | null;
   } | null;
 }
 
@@ -99,15 +104,16 @@ const EMPTY_FILTERS: FilterState = {
   isNoLongerVisible: false,
   negativeProfit: false,
   highPriority: false,
+  payRangeFit: "",
 };
 
 type KpiTile =
   | "total"
   | "newToday"
   | "highPriority"
-  | "negativeProfit"
-  | "noLongerVisible"
-  | "avgScore";
+  | "strongPayRangeFit"
+  | "belowMarket"
+  | "averageTargetPay";
 
 
 interface ImportBatch {
@@ -176,6 +182,7 @@ export function Dashboard() {
       if (filters.isNoLongerVisible) params.append("isNoLongerVisible", "true");
       if (filters.negativeProfit) params.append("negativeProfit", "true");
       if (filters.highPriority) params.append("highPriority", "true");
+      if (filters.payRangeFit) params.append("payRangeFit", filters.payRangeFit);
 
       const response = await fetch(`/api/requisitions?${params}`, {
         cache: "no-store",
@@ -292,27 +299,30 @@ export function Dashboard() {
       negativeProfit: data?.kpis?.negativeProfit ?? 0,
       noLongerVisible: data?.kpis?.noLongerVisible ?? 0,
       avgScore: data?.kpis?.averageOpportunityScore ?? 0,
+      strongPayRangeFit: data?.kpis?.strongPayRangeFit ?? 0,
+      belowMarket: data?.kpis?.belowMarket ?? 0,
+      averageTargetPay: data?.kpis?.averageTargetPay ?? null,
     };
   }, [data]);
 
   const activeKpi: KpiTile | null = useMemo(() => {
     if (filters.isNewToday) return "newToday";
     if (filters.highPriority) return "highPriority";
-    if (filters.negativeProfit) return "negativeProfit";
-    if (filters.isNoLongerVisible) return "noLongerVisible";
-    if (sortBy === "opportunityScore") return "avgScore";
+    if (filters.payRangeFit === "Strong Fit") return "strongPayRangeFit";
+    if (filters.payRangeFit === "Below Market") return "belowMarket";
     if (
       !filters.search &&
       !filters.status &&
       !filters.recommendation &&
       !filters.minScore &&
       !filters.maxScore &&
-      !filters.customer
+      !filters.customer &&
+      !filters.payRangeFit
     ) {
       return "total";
     }
     return null;
-  }, [filters, sortBy]);
+  }, [filters]);
 
   const applyKpiFilter = (tile: KpiTile) => {
     setPage(1);
@@ -333,18 +343,18 @@ export function Dashboard() {
       setFilters({ ...EMPTY_FILTERS, highPriority: true });
       setSortBy("rank");
       setSortOrder("asc");
-    } else if (tile === "negativeProfit") {
-      setFilters({ ...EMPTY_FILTERS, negativeProfit: true });
+    } else if (tile === "strongPayRangeFit") {
+      setFilters({ ...EMPTY_FILTERS, payRangeFit: "Strong Fit" });
       setSortBy("rank");
       setSortOrder("asc");
-    } else if (tile === "noLongerVisible") {
-      setFilters({ ...EMPTY_FILTERS, isNoLongerVisible: true });
+    } else if (tile === "belowMarket") {
+      setFilters({ ...EMPTY_FILTERS, payRangeFit: "Below Market" });
       setSortBy("rank");
       setSortOrder("asc");
-    } else if (tile === "avgScore") {
+    } else if (tile === "averageTargetPay") {
       setFilters(EMPTY_FILTERS);
-      setSortBy("opportunityScore");
-      setSortOrder("desc");
+      setSortBy("rank");
+      setSortOrder("asc");
     }
 
     requestAnimationFrame(() => {
@@ -423,6 +433,7 @@ export function Dashboard() {
     filters.isNoLongerVisible ||
     filters.negativeProfit ||
     filters.highPriority ||
+    filters.payRangeFit ||
     sortBy !== "rank";
 
   const clearFilters = () => {
@@ -532,33 +543,38 @@ export function Dashboard() {
                 active={activeKpi === "highPriority"}
               />
               <StatCard
-                title="Negative Profit"
-                value={kpis.negativeProfit.toLocaleString()}
-                icon={<AlertTriangleIcon className="w-5 h-5" />}
-                accent={kpis.negativeProfit > 0 ? "danger" : "default"}
-                isLoading={loading}
-                onClick={() => applyKpiFilter("negativeProfit")}
-                active={activeKpi === "negativeProfit"}
-              />
-              <StatCard
-                title="No Longer Visible"
-                value={kpis.noLongerVisible.toLocaleString()}
-                icon={<EyeOffIcon className="w-5 h-5" />}
-                accent={kpis.noLongerVisible > 0 ? "warning" : "default"}
-                isLoading={loading}
-                onClick={() => applyKpiFilter("noLongerVisible")}
-                active={activeKpi === "noLongerVisible"}
-              />
-              <StatCard
-                title="Avg Score"
-                value={kpis.avgScore.toString()}
+                title="Strong Pay Range Fit"
+                value={kpis.strongPayRangeFit.toLocaleString()}
                 icon={<GaugeIcon className="w-5 h-5" />}
-                description="Opportunity score"
+                accent="success"
                 isLoading={loading}
-                onClick={() => applyKpiFilter("avgScore")}
-                active={activeKpi === "avgScore"}
+                onClick={() => applyKpiFilter("strongPayRangeFit")}
+                active={activeKpi === "strongPayRangeFit"}
+              />
+              <StatCard
+                title="Below Market"
+                value={kpis.belowMarket.toLocaleString()}
+                icon={<AlertTriangleIcon className="w-5 h-5" />}
+                accent={kpis.belowMarket > 0 ? "danger" : "default"}
+                isLoading={loading}
+                onClick={() => applyKpiFilter("belowMarket")}
+                active={activeKpi === "belowMarket"}
+              />
+              <StatCard
+                title="Average Target Pay"
+                value={kpis.averageTargetPay == null ? "—" : `$${kpis.averageTargetPay.toFixed(2)}/hr`}
+                icon={<GaugeIcon className="w-5 h-5" />}
+                description="Selected pay rate"
+                isLoading={loading}
+                onClick={() => applyKpiFilter("averageTargetPay")}
+                active={false}
               />
             </div>
+            {!loading && kpis.negativeProfit > 0 && (
+              <p className="-mt-3 mb-6 text-xs font-medium text-red-700">
+                {kpis.negativeProfit.toLocaleString()} requisitions currently have negative estimated profit.
+              </p>
+            )}
 
             {/* Quick Insights */}
             {hasRequisitions && quickInsights && (

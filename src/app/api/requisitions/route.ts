@@ -28,6 +28,9 @@ const querySchema = z.object({
   isNoLongerVisible: z.boolean().optional(),
   negativeProfit: z.boolean().optional(),
   highPriority: z.boolean().optional(),
+  payRangeFit: z
+    .enum(["Strong Fit", "Workable", "Tight", "Below Market", "Requires Review", "Unavailable"])
+    .optional(),
   page: z.number().int().min(1).default(1),
   limit: z.number().int().min(1).max(100).default(20),
   sortBy: z
@@ -73,6 +76,7 @@ export async function GET(request: NextRequest) {
       highPriority: searchParams.has("highPriority")
         ? searchParams.get("highPriority") === "true"
         : undefined,
+      payRangeFit: optionalQueryParam(searchParams.get("payRangeFit")),
       page: coercePositiveInt(searchParams.get("page"), 1, { min: 1 }),
       limit: coercePositiveInt(searchParams.get("limit"), 20, { min: 1, max: 100 }),
       sortBy: optionalQueryParam(searchParams.get("sortBy")) ?? "rank",

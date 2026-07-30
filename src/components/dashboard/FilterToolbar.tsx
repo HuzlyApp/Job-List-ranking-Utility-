@@ -18,6 +18,7 @@ export interface FilterState {
   isNoLongerVisible: boolean;
   negativeProfit: boolean;
   highPriority: boolean;
+  payRangeFit: string;
 }
 
 interface FilterToolbarProps {
@@ -57,6 +58,7 @@ export function FilterToolbar({ filters, onChange, customers }: FilterToolbarPro
     filters.isNoLongerVisible,
     filters.negativeProfit,
     filters.highPriority,
+    filters.payRangeFit,
   ].filter(Boolean).length;
 
   const handleClearFilters = () => {
@@ -71,6 +73,7 @@ export function FilterToolbar({ filters, onChange, customers }: FilterToolbarPro
       isNoLongerVisible: false,
       negativeProfit: false,
       highPriority: false,
+      payRangeFit: "",
     });
   };
 
@@ -238,6 +241,12 @@ export function FilterToolbar({ filters, onChange, customers }: FilterToolbarPro
             <FilterChip
               label="New Today"
               onRemove={() => onChange({ ...filters, isNewToday: false })}
+            />
+          )}
+          {filters.payRangeFit && (
+            <FilterChip
+              label={`Pay Range Fit: ${filters.payRangeFit}`}
+              onRemove={() => onChange({ ...filters, payRangeFit: "" })}
             />
           )}
           {filters.highPriority && (

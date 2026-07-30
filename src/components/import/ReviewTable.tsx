@@ -1,7 +1,13 @@
 "use client";
 
 import { useState } from "react";
-import { SearchIcon, FilterIcon, AlertTriangleIcon, CheckIcon, XIcon } from "@/components/ui/icons";
+import { SearchIcon, FilterIcon } from "@/components/ui/icons";
+import {
+  DUPLICATE_STATUSES,
+  duplicateStatusBadgeClass,
+  type DuplicateStatus,
+} from "@/lib/duplicate-check";
+import { formatPayRange } from "@/lib/pay-range";
 
 export type ReviewFilter = "all" | "valid" | "needs_review" | "missing_id" | "missing_rate" | "duplicate" | "excluded";
 
@@ -13,6 +19,9 @@ interface ReviewRow {
   rowNumber: number | null;
   sourceConfidence: string;
   dataQualityNotes: string[];
+  duplicateStatus?: string;
+  duplicateMatchReason?: string | null;
+  existingRecord?: Record<string, unknown> | null;
   data: {
     requisition_id: string | null;
     status: string | null;
@@ -24,6 +33,8 @@ interface ReviewRow {
     location: string | null;
     duration: string | null;
     position_type: string | null;
+    recommended_w2_pay_min?: string | number | null;
+    recommended_w2_pay_max?: string | number | null;
   };
 }
 
@@ -72,7 +83,7 @@ export function ReviewTable({ rows, onUpdate, selectedRowId, onSelectRow }: Revi
       case "missing_rate":
         return !row.excluded && !row.data.c2c_bill_rate;
       case "duplicate":
-        return row.dataQualityNotes.some((n) => n.toLowerCase().includes("duplicate"));
+        return /(duplicate|already|conflict|possible)/i.test(row.duplicateStatus || "");
       case "excluded":
         return row.excluded;
       default:
@@ -80,10 +91,11 @@ export function ReviewTable({ rows, onUpdate, selectedRowId, onSelectRow }: Revi
     }
   });
 
-  const formatBillRate = (row: ReviewRow["data"]) => {
-    if (row.c2c_bill_rate_normalized) return `$${row.c2c_bill_rate_normalized}`;
-    if (row.c2c_bill_rate != null) return `$${row.c2c_bill_rate.toFixed(2)}`;
-    return "—";
+  const getDuplicateStatus = (row: ReviewRow): DuplicateStatus => {
+    const status = row.duplicateStatus;
+    return DUPLICATE_STATUSES.includes(status as DuplicateStatus)
+      ? (status as DuplicateStatus)
+      : "New";
   };
 
   const getIssueBadges = (row: ReviewRow) => {
@@ -99,13 +111,6 @@ export function ReviewTable({ rows, onUpdate, selectedRowId, onSelectRow }: Revi
       badges.push(
         <span key="missing-rate" className="inline-flex items-center px-1.5 py-0.5 text-xs font-bold bg-red-100 text-red-800 rounded">
           Missing Rate
-        </span>
-      );
-    }
-    if (row.dataQualityNotes.some((n) => n.toLowerCase().includes("duplicate"))) {
-      badges.push(
-        <span key="duplicate" className="inline-flex items-center px-1.5 py-0.5 text-xs font-bold bg-amber-100 text-amber-800 rounded">
-          Duplicate
         </span>
       );
     }
@@ -164,7 +169,10 @@ export function ReviewTable({ rows, onUpdate, selectedRowId, onSelectRow }: Revi
                 <span className="sr-only">Include</span>
               </th>
               <th className="px-3 py-3 text-left text-xs font-bold text-slate-800 uppercase tracking-wider">
-                Issues
+                Duplicate Status
+              </th>
+              <th className="px-3 py-3 text-left text-xs font-bold text-slate-800 uppercase tracking-wider">
+                Confidence
               </th>
               <th className="px-3 py-3 text-left text-xs font-bold text-slate-800 uppercase tracking-wider">
                 Req ID
@@ -176,13 +184,25 @@ export function ReviewTable({ rows, onUpdate, selectedRowId, onSelectRow }: Revi
                 Job Title
               </th>
               <th className="px-3 py-3 text-left text-xs font-bold text-slate-800 uppercase tracking-wider">
-                Sub
-              </th>
-              <th className="px-3 py-3 text-left text-xs font-bold text-slate-800 uppercase tracking-wider">
                 Bill Rate
               </th>
               <th className="px-3 py-3 text-left text-xs font-bold text-slate-800 uppercase tracking-wider">
+                Recommended Pay Range
+              </th>
+              <th className="px-3 py-3 text-left text-xs font-bold text-slate-800 uppercase tracking-wider">
+                Submissions
+              </th>
+              <th className="px-3 py-3 text-left text-xs font-bold text-slate-800 uppercase tracking-wider">
                 Location
+              </th>
+              <th className="px-3 py-3 text-left text-xs font-bold text-slate-800 uppercase tracking-wider">
+                Duration
+              </th>
+              <th className="px-3 py-3 text-left text-xs font-bold text-slate-800 uppercase tracking-wider">
+                Issues
+              </th>
+              <th className="px-3 py-3 text-left text-xs font-bold text-slate-800 uppercase tracking-wider">
+                Actions
               </th>
             </tr>
           </thead>
@@ -205,9 +225,22 @@ export function ReviewTable({ rows, onUpdate, selectedRowId, onSelectRow }: Revi
                   />
                 </td>
                 <td className="px-3 py-3">
-                  <div className="flex flex-wrap gap-1">
-                    {getIssueBadges(row)}
-                  </div>
+                  <button
+                    type="button"
+                    title={row.duplicateMatchReason || undefined}
+                    onClick={(event) => {
+                      event.stopPropagation();
+                      onSelectRow?.(row.id);
+                    }}
+                    className={`inline-flex items-center whitespace-nowrap px-2 py-1 text-xs font-bold rounded-full border ${duplicateStatusBadgeClass(getDuplicateStatus(row))}`}
+                  >
+                    {getDuplicateStatus(row)}
+                  </button>
+                </td>
+                <td className="px-3 py-3">
+                  <span className="text-sm font-medium text-slate-700">
+                    {row.sourceConfidence || "—"}
+                  </span>
                 </td>
                 <td className="px-3 py-3">
                   <input
@@ -229,11 +262,6 @@ export function ReviewTable({ rows, onUpdate, selectedRowId, onSelectRow }: Revi
                   </span>
                 </td>
                 <td className="px-3 py-3">
-                  <span className="text-sm font-bold text-slate-800 tabular-nums">
-                    {row.data.submissions ?? "—"}
-                  </span>
-                </td>
-                <td className="px-3 py-3">
                   <input
                     className="w-24 px-2 py-1 text-sm font-bold text-slate-800 border border-slate-300 rounded focus:ring-2 focus:ring-emerald-500 focus:border-emerald-500 outline-none"
                     value={row.data.c2c_bill_rate_normalized || (row.data.c2c_bill_rate != null ? String(row.data.c2c_bill_rate) : "")}
@@ -248,9 +276,47 @@ export function ReviewTable({ rows, onUpdate, selectedRowId, onSelectRow }: Revi
                   />
                 </td>
                 <td className="px-3 py-3">
+                  <span className="whitespace-nowrap text-sm font-bold text-emerald-700 tabular-nums">
+                    {row.data.recommended_w2_pay_min == null ||
+                    row.data.recommended_w2_pay_max == null
+                      ? formatPayRange(null, null, "pending")
+                      : formatPayRange(
+                          row.data.recommended_w2_pay_min,
+                          row.data.recommended_w2_pay_max
+                        )}
+                  </span>
+                </td>
+                <td className="px-3 py-3">
+                  <span className="text-sm font-bold text-slate-800 tabular-nums">
+                    {row.data.submissions ?? "—"}
+                  </span>
+                </td>
+                <td className="px-3 py-3">
                   <span className="text-sm font-medium text-slate-700">
                     {row.data.location || "—"}
                   </span>
+                </td>
+                <td className="px-3 py-3">
+                  <span className="whitespace-nowrap text-sm font-medium text-slate-700">
+                    {row.data.duration || "—"}
+                  </span>
+                </td>
+                <td className="px-3 py-3">
+                  <div className="flex flex-wrap gap-1">
+                    {getIssueBadges(row)}
+                  </div>
+                </td>
+                <td className="px-3 py-3">
+                  <button
+                    type="button"
+                    onClick={(event) => {
+                      event.stopPropagation();
+                      onSelectRow?.(selectedRowId === row.id ? null : row.id);
+                    }}
+                    className="text-xs font-bold text-emerald-700 hover:text-emerald-900"
+                  >
+                    {selectedRowId === row.id ? "Selected" : "Compare"}
+                  </button>
                 </td>
               </tr>
             ))}

@@ -50,14 +50,38 @@ export type ClaudeExtractionOutput = z.infer<typeof ClaudeExtractionSchema>;
 export const ClaudePayAnalysisItemSchema = z.object({
   requisition_id: z.string().min(1),
 
-  recommended_w2_pay_min: z.number().nonnegative().nullable(),
-  recommended_w2_pay_max: z.number().nonnegative().nullable(),
+  // Preferred field names (pay-range first)
+  recommended_pay_min: z.number().nonnegative().nullable().optional(),
+  recommended_pay_max: z.number().nonnegative().nullable().optional(),
+  // Backward-compatible aliases
+  recommended_w2_pay_min: z.number().nonnegative().nullable().optional(),
+  recommended_w2_pay_max: z.number().nonnegative().nullable().optional(),
 
-  pay_estimate_reason: z.string().min(1),
+  pay_range_confidence: z.enum(["High", "Medium", "Low"]).optional().default("Medium"),
+  pay_range_reason: z.string().min(1).optional(),
+  pay_estimate_reason: z.string().min(1).optional(),
+
+  pay_range_fit: z
+    .enum([
+      "Strong Fit",
+      "Workable",
+      "Tight",
+      "Below Market",
+      "Requires Review",
+      "Unavailable",
+    ])
+    .optional(),
+
   market_rate_warning: z.string().nullable(),
 
   fillability_score: z.number().min(0).max(100),
-  fillability_label: z.enum(["Easy", "Moderate", "Difficult", "Very Difficult", "Extremely Difficult"]),
+  fillability_label: z.enum([
+    "Easy",
+    "Moderate",
+    "Difficult",
+    "Very Difficult",
+    "Extremely Difficult",
+  ]),
   fillability_reason: z.string().min(1),
 
   suggested_risk_classification: z.enum([
@@ -66,6 +90,32 @@ export const ClaudePayAnalysisItemSchema = z.object({
     "healthcare",
     "manual_review",
   ]),
+}).transform((item) => {
+  const recommended_w2_pay_min =
+    item.recommended_pay_min ?? item.recommended_w2_pay_min ?? null;
+  const recommended_w2_pay_max =
+    item.recommended_pay_max ?? item.recommended_w2_pay_max ?? null;
+  const pay_estimate_reason =
+    item.pay_range_reason ||
+    item.pay_estimate_reason ||
+    "Pay range estimated from role and market context";
+
+  return {
+    requisition_id: item.requisition_id,
+    recommended_w2_pay_min,
+    recommended_w2_pay_max,
+    recommended_pay_min: recommended_w2_pay_min,
+    recommended_pay_max: recommended_w2_pay_max,
+    pay_range_confidence: item.pay_range_confidence || "Medium",
+    pay_estimate_reason,
+    pay_range_reason: pay_estimate_reason,
+    pay_range_fit: item.pay_range_fit,
+    market_rate_warning: item.market_rate_warning,
+    fillability_score: item.fillability_score,
+    fillability_label: item.fillability_label,
+    fillability_reason: item.fillability_reason,
+    suggested_risk_classification: item.suggested_risk_classification,
+  };
 });
 
 export type ClaudePayAnalysisItem = z.infer<typeof ClaudePayAnalysisItemSchema>;

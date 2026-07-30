@@ -32,6 +32,13 @@ export interface RequisitionListParams {
   isNoLongerVisible?: boolean;
   negativeProfit?: boolean;
   highPriority?: boolean;
+  payRangeFit?:
+    | "Strong Fit"
+    | "Workable"
+    | "Tight"
+    | "Below Market"
+    | "Requires Review"
+    | "Unavailable";
   page: number;
   limit: number;
   sortBy: RequisitionListSortBy;
@@ -115,6 +122,7 @@ export async function listRequisitionsWithAnalysis(params: RequisitionListParams
       selectedPayRate: requisitionAnalysisResults.selectedPayRate,
       payScenario: requisitionAnalysisResults.payScenario,
       payEstimateReason: requisitionAnalysisResults.payEstimateReason,
+      payRangeFit: requisitionAnalysisResults.payRangeFit,
       marketRateWarning: requisitionAnalysisResults.marketRateWarning,
       roleRiskClassification: requisitionAnalysisResults.roleRiskClassification,
       effectiveVendorRate: requisitionAnalysisResults.effectiveVendorRate,
@@ -171,6 +179,9 @@ export interface DashboardKpis {
   negativeProfit: number;
   noLongerVisible: number;
   averageOpportunityScore: number | null;
+  strongPayRangeFit: number;
+  belowMarket: number;
+  averageTargetPay: number | null;
 }
 
 export async function getDashboardKpis(tenantId: string, mspProgramId?: string): Promise<DashboardKpis> {
@@ -188,6 +199,9 @@ export async function getDashboardKpis(tenantId: string, mspProgramId?: string):
       highPriority: sql<number>`count(*) filter (where ${requisitionAnalysisResults.finalRecommendation} in ('Recruit Immediately', 'High Priority'))::int`,
       negativeProfit: sql<number>`count(*) filter (where ${requisitionAnalysisResults.estimatedProfitPerHour} is not null and ${requisitionAnalysisResults.estimatedProfitPerHour}::numeric < 0)::int`,
       averageOpportunityScore: sql<number | null>`avg(${requisitionAnalysisResults.opportunityScore}) filter (where ${requisitionAnalysisResults.opportunityScore} is not null)`,
+      strongPayRangeFit: sql<number>`count(*) filter (where ${requisitionAnalysisResults.payRangeFit} = 'Strong Fit')::int`,
+      belowMarket: sql<number>`count(*) filter (where ${requisitionAnalysisResults.payRangeFit} = 'Below Market')::int`,
+      averageTargetPay: sql<number | null>`round(avg(${requisitionAnalysisResults.selectedPayRate}) filter (where ${requisitionAnalysisResults.selectedPayRate} is not null), 2)`,
     })
     .from(requisitions)
     .leftJoin(
@@ -205,6 +219,12 @@ export async function getDashboardKpis(tenantId: string, mspProgramId?: string):
     noLongerVisible: Number(row?.noLongerVisible) || 0,
     averageOpportunityScore:
       avg === null || avg === undefined ? null : Math.round(Number(avg)),
+    strongPayRangeFit: Number(row?.strongPayRangeFit) || 0,
+    belowMarket: Number(row?.belowMarket) || 0,
+    averageTargetPay:
+      row?.averageTargetPay === null || row?.averageTargetPay === undefined
+        ? null
+        : Number(row.averageTargetPay),
   };
 }
 
@@ -244,6 +264,11 @@ function buildRequisitionWhere(params: RequisitionListParams): SQL | undefined {
   if (params.negativeProfit) {
     whereConditions.push(
       sql`${requisitionAnalysisResults.estimatedProfitPerHour} is not null and ${requisitionAnalysisResults.estimatedProfitPerHour}::numeric < 0`
+    );
+  }
+  if (params.payRangeFit) {
+    whereConditions.push(
+      eq(requisitionAnalysisResults.payRangeFit, params.payRangeFit)
     );
   }
   if (params.recommendation) {
@@ -316,6 +341,7 @@ type JoinedRequisitionRow = {
   selectedPayRate: string | null;
   payScenario: string | null;
   payEstimateReason: string | null;
+  payRangeFit: string | null;
   marketRateWarning: string | null;
   roleRiskClassification: string | null;
   effectiveVendorRate: string | null;
@@ -391,6 +417,7 @@ function mapJoinedRow(row: JoinedRequisitionRow) {
           selectedPayRate: row.selectedPayRate,
           payScenario: row.payScenario,
           payEstimateReason: row.payEstimateReason,
+          payRangeFit: row.payRangeFit,
           marketRateWarning: row.marketRateWarning,
           roleRiskClassification: row.roleRiskClassification,
           effectiveVendorRate: row.effectiveVendorRate,

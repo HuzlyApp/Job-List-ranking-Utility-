@@ -7,6 +7,7 @@ import {
   requisitionAnalysisResults,
   requisitionSnapshots,
   mspPrograms,
+  auditLogs,
 } from "@/db/schema";
 import { eq, and, sql } from "drizzle-orm";
 import { v4 as uuidv4 } from "uuid";
@@ -32,6 +33,18 @@ import {
   getFillabilityLabel,
 } from "@/lib/financial-calculations";
 import { CUSTOMER_ALIASES } from "@/types";
+import {
+  annotateImportRows,
+  findExistingRequisitionsByIds,
+  findPossibleDuplicates,
+  summarizeDuplicateAnnotations,
+} from "@/lib/duplicate-check";
+import {
+  buildPayFirstExplanation,
+  derivePayRangeFit,
+  parsePayNumber,
+  type PayRangeFit,
+} from "@/lib/pay-range";
 
 type RequisitionAnalysisBatch = typeof requisitionAnalysisBatches.$inferSelect;
 
@@ -648,6 +661,14 @@ export async function runPayAnalysis(
         recommended_w2_pay_min: pay.recommended_w2_pay_min,
         recommended_w2_pay_max: pay.recommended_w2_pay_max,
         pay_estimate_reason: pay.pay_estimate_reason,
+        pay_range_confidence: pay.pay_range_confidence,
+        pay_range_fit:
+          pay.pay_range_fit ||
+          derivePayRangeFit({
+            billRate: data.c2c_bill_rate,
+            payMin: pay.recommended_w2_pay_min,
+            payMax: pay.recommended_w2_pay_max,
+          }),
         market_rate_warning: pay.market_rate_warning,
         fillability_score: pay.fillability_score,
         fillability_label: pay.fillability_label,
@@ -667,11 +688,21 @@ export async function runPayAnalysis(
       if (!data.requisition_id || !data.c2c_bill_rate) continue;
       const effectiveRate = data.c2c_bill_rate * 0.98;
       const payMid = Math.round(effectiveRate * 0.55);
+      const payMin = payMid - 1;
+      const payMax = payMid + 1;
       const enriched = {
         ...data,
-        recommended_w2_pay_min: payMid - 1,
-        recommended_w2_pay_max: payMid + 1,
-        pay_estimate_reason: "Estimated from bill rate (Claude unavailable)",
+        recommended_w2_pay_min: payMin,
+        recommended_w2_pay_max: payMax,
+        pay_estimate_reason:
+          "Estimated from bill rate (Claude unavailable). Leading with candidate pay viability.",
+        pay_range_confidence: "Low" as const,
+        pay_range_fit: derivePayRangeFit({
+          billRate: data.c2c_bill_rate,
+          payMin,
+          payMax,
+          analysisFailed: true,
+        }),
         fillability_score: 70,
         fillability_label: "Moderate" as const,
       };
@@ -684,9 +715,21 @@ export async function runPayAnalysis(
 }
 
 /**
- * Get rows for review (uses confirmedJson if set, else extractedJson)
+ * Get rows for review with Neon + in-batch duplicate annotations.
  */
 export async function getReviewRows(batchId: string, tenantId: string) {
+  const [batch] = await db
+    .select({
+      mspProgramId: requisitionAnalysisBatches.mspProgramId,
+    })
+    .from(requisitionAnalysisBatches)
+    .where(
+      and(
+        eq(requisitionAnalysisBatches.id, batchId),
+        eq(requisitionAnalysisBatches.tenantId, tenantId)
+      )
+    );
+
   const rows = await db
     .select({
       row: requisitionSourceRows,
@@ -704,17 +747,108 @@ export async function getReviewRows(batchId: string, tenantId: string) {
       )
     );
 
-  return rows.map(({ row, file }) => ({
-    id: row.id,
-    excluded: row.excluded,
-    sourceFilename: file?.originalFilename || "",
-    sheetName: row.sheetName,
-    rowNumber: row.rowNumber,
-    data: (row.confirmedJson || row.extractedJson) as ExtractedRequisition,
-    sourceConfidence: row.sourceConfidence,
-    dataQualityNotes: (row.dataQualityNotes as string[]) || [],
-    manuallyEdited: row.manuallyEdited,
-  }));
+  const dataRows = rows.map(({ row }) => {
+    const data = (row.confirmedJson || row.extractedJson) as ExtractedRequisition;
+    return data;
+  });
+
+  const reqIds = dataRows
+    .map((d) => d.requisition_id)
+    .filter((id): id is string => Boolean(id));
+
+  const existingByReqId = batch?.mspProgramId
+    ? await findExistingRequisitionsByIds({
+        tenantId,
+        mspProgramId: batch.mspProgramId,
+        requisitionIds: reqIds,
+      })
+    : new Map();
+
+  const missingIdCandidates = dataRows.filter((d) => !d.requisition_id);
+  const possibleBySignature = batch?.mspProgramId
+    ? await findPossibleDuplicates({
+        tenantId,
+        mspProgramId: batch.mspProgramId,
+        candidates: missingIdCandidates.map((d) => ({
+          customer: d.customer,
+          job_title: d.job_title,
+          location: d.location,
+        })),
+      })
+    : new Map();
+
+  const annotated = annotateImportRows({
+    rows: dataRows,
+    existingByReqId,
+    possibleBySignature,
+  });
+
+  const checkedAt = new Date();
+  await Promise.all(
+    rows.map(async ({ row }, index) => {
+      const dup = annotated[index].duplicate;
+      await db
+        .update(requisitionSourceRows)
+        .set({
+          duplicateStatus: dup.duplicateStatus,
+          matchedExistingRequisitionId: dup.matchedExistingRequisitionId,
+          duplicateMatchReason: dup.duplicateMatchReason,
+          duplicateCheckedAt: checkedAt,
+        })
+        .where(eq(requisitionSourceRows.id, row.id));
+    })
+  );
+
+  const summary = summarizeDuplicateAnnotations(
+    annotated.map((row) => ({
+      requisition_id: row.requisition_id,
+      duplicate: row.duplicate,
+    }))
+  );
+
+  return {
+    rows: rows.map(({ row, file }, index) => {
+      const data = annotated[index];
+      const { duplicate, ...requisitionData } = data;
+      return {
+        id: row.id,
+        excluded: row.excluded,
+        sourceFilename: file?.originalFilename || "",
+        sheetName: row.sheetName,
+        rowNumber: row.rowNumber,
+        data: requisitionData as ExtractedRequisition,
+        sourceConfidence: row.sourceConfidence,
+        dataQualityNotes: (row.dataQualityNotes as string[]) || [],
+        manuallyEdited: row.manuallyEdited,
+        duplicateStatus: duplicate.duplicateStatus,
+        duplicateMatchReason: duplicate.duplicateMatchReason,
+        matchedExistingRequisitionId: duplicate.matchedExistingRequisitionId,
+        existingRecord: duplicate.existing
+          ? {
+              id: duplicate.existing.id,
+              requisitionId: duplicate.existing.requisitionId,
+              status: duplicate.existing.status,
+              customer:
+                duplicate.existing.normalizedCustomerName ||
+                duplicate.existing.sourceCustomerName,
+              jobTitle: duplicate.existing.jobTitle,
+              location: duplicate.existing.location,
+              billRate: duplicate.existing.displayedVendorRate,
+              submissionCount: duplicate.existing.submissionCount,
+              activeSubmissionCount: duplicate.existing.activeSubmissionCount,
+              duration: duplicate.existing.sourceDuration,
+              firstSeenAt: duplicate.existing.firstSeenAt,
+              lastSeenAt: duplicate.existing.lastSeenAt,
+              lastAnalyzedAt: duplicate.existing.lastAnalyzedAt,
+              recommendedPayMin: duplicate.existing.recommendedPayMin,
+              recommendedPayMax: duplicate.existing.recommendedPayMax,
+            }
+          : null,
+        batchOccurrenceCount: duplicate.batchOccurrenceCount,
+      };
+    }),
+    duplicateSummary: summary,
+  };
 }
 
 /**
@@ -797,6 +931,13 @@ export async function finalizeBatch(
   analysesCompleted: number;
   analysesPending: number;
   requiresReview: number;
+  newRecordsCreated: number;
+  existingRecordsUpdated: number;
+  unchangedExistingRecords: number;
+  duplicatesConsolidated: number;
+  possibleDuplicatesRemaining: number;
+  analysisRecordsCreated: number;
+  analysisRecordsReused: number;
 }> {
   console.info("[finalize.start]", { batch_id: batchId, tenant_id: tenantId });
 
@@ -859,6 +1000,26 @@ export async function finalizeBatch(
     requiresManualReview: boolean;
   }> = [];
 
+  let newRecordsCreated = 0;
+  let existingRecordsUpdated = 0;
+  let unchangedExistingRecords = 0;
+  let analysisRecordsCreated = 0;
+  let analysisRecordsReused = 0;
+
+  const includedSourceRows = await db
+    .select({ count: sql<number>`count(*)::int` })
+    .from(requisitionSourceRows)
+    .where(
+      and(
+        eq(requisitionSourceRows.batchId, batchId),
+        eq(requisitionSourceRows.tenantId, tenantId),
+        eq(requisitionSourceRows.excluded, false)
+      )
+    );
+  const includedCount = Number(includedSourceRows[0]?.count) || 0;
+  const duplicatesConsolidated = Math.max(0, includedCount - rows.length);
+  const possibleDuplicatesRemaining = rows.filter((r) => !r.requisition_id).length;
+
   for (const row of rows) {
     if (!row.requisition_id) continue;
     const analyzedRow = row as ExtractedRequisition & {
@@ -867,12 +1028,33 @@ export async function finalizeBatch(
       fillability_score?: number | null;
       pay_estimate_reason?: string | null;
       market_rate_warning?: string | null;
+      pay_range_fit?: PayRangeFit | null;
+      pay_range_confidence?: "High" | "Medium" | "Low" | null;
+      fillability_reason?: string | null;
     };
 
     // Calculate pay midpoint
     const payMin = analyzedRow.recommended_w2_pay_min || 0;
     const payMax = analyzedRow.recommended_w2_pay_max || 0;
     const payMidpoint = (payMin + payMax) / 2;
+    const payRangeFit: PayRangeFit =
+      analyzedRow.pay_range_fit ||
+      derivePayRangeFit({
+        billRate: parsePayNumber(row.c2c_bill_rate),
+        payMin: payMin || null,
+        payMax: payMax || null,
+        missingRequired: !row.c2c_bill_rate || !payMin || !payMax,
+      });
+    const payEstimateReason =
+      analyzedRow.pay_estimate_reason ||
+      buildPayFirstExplanation({
+        payMin: payMin || null,
+        payMax: payMax || null,
+        payRangeFit,
+        fillabilityLabel: getFillabilityLabel(analyzedRow.fillability_score || 50),
+        submissionCount: row.submissions,
+        marketRateWarning: analyzedRow.market_rate_warning,
+      });
 
     // Parse duration
     const durationWeeks =
@@ -960,7 +1142,14 @@ export async function finalizeBatch(
       );
 
     if (existingReq) {
-      // Update existing
+      const billChanged =
+        (row.c2c_bill_rate_normalized || row.c2c_bill_rate?.toString() || null) !==
+        existingReq.displayedVendorRate;
+      const titleChanged = (row.job_title || null) !== existingReq.jobTitle;
+      const submissionsChanged =
+        (row.submissions ?? null) !== (existingReq.submissionCount ?? null);
+      const changed = billChanged || titleChanged || submissionsChanged;
+
       await db
         .update(requisitions)
         .set({
@@ -987,35 +1176,93 @@ export async function finalizeBatch(
           updatedAt: now,
         })
         .where(eq(requisitions.id, existingReq.id));
+
+      if (changed) {
+        existingRecordsUpdated += 1;
+        await db.insert(auditLogs).values({
+          id: uuidv4(),
+          tenantId,
+          action: "requisition.updated_from_import",
+          entityType: "requisition",
+          entityId: existingReq.id,
+          previousState: {
+            billRate: existingReq.displayedVendorRate,
+            jobTitle: existingReq.jobTitle,
+            submissionCount: existingReq.submissionCount,
+          },
+          newState: {
+            billRate:
+              row.c2c_bill_rate_normalized || row.c2c_bill_rate?.toString() || null,
+            jobTitle: row.job_title,
+            submissionCount: row.submissions,
+            batchId,
+          },
+        });
+      } else {
+        unchangedExistingRecords += 1;
+      }
     } else {
-      // Insert new
-      await db.insert(requisitions).values({
-        id: uuidv4(),
-        tenantId,
-        mspProgramId,
-        requisitionId: row.requisition_id,
-        status: row.status,
-        sourceCustomerName: row.customer,
-        normalizedCustomerName: normalizeCustomerName(row.customer),
-        jobTitle: row.job_title,
-        location: row.location,
-        sourceDuration: row.duration,
-        normalizedDurationWeeks: durationWeeks?.toString() || null,
-        numberOfPositions: row.number_of_positions,
-        submissionCount: row.submissions,
-        activeSubmissionCount: row.active_submissions,
-        displayedVendorRate:
-          row.c2c_bill_rate_normalized || row.c2c_bill_rate?.toString() || null,
-        releasedDate: row.released_date ? new Date(row.released_date) : null,
-        positionType: row.position_type,
-        remoteOrOnsite: row.remote_or_onsite || "Unknown",
-        sourceConfidence: row.source_confidence,
-        dataQualityNotes: row.data_quality_notes || [],
-        firstSeenAt: now,
-        lastSeenAt: now,
-        lastAnalyzedAt: now,
-        isNewToday: true,
-      });
+      // Insert new — conflict-safe against concurrent imports of the same key
+      await db
+        .insert(requisitions)
+        .values({
+          id: uuidv4(),
+          tenantId,
+          mspProgramId,
+          requisitionId: row.requisition_id,
+          status: row.status,
+          sourceCustomerName: row.customer,
+          normalizedCustomerName: normalizeCustomerName(row.customer),
+          jobTitle: row.job_title,
+          location: row.location,
+          sourceDuration: row.duration,
+          normalizedDurationWeeks: durationWeeks?.toString() || null,
+          numberOfPositions: row.number_of_positions,
+          submissionCount: row.submissions,
+          activeSubmissionCount: row.active_submissions,
+          displayedVendorRate:
+            row.c2c_bill_rate_normalized || row.c2c_bill_rate?.toString() || null,
+          releasedDate: row.released_date ? new Date(row.released_date) : null,
+          positionType: row.position_type,
+          remoteOrOnsite: row.remote_or_onsite || "Unknown",
+          sourceConfidence: row.source_confidence,
+          dataQualityNotes: row.data_quality_notes || [],
+          firstSeenAt: now,
+          lastSeenAt: now,
+          lastAnalyzedAt: now,
+          isNewToday: true,
+        })
+        .onConflictDoUpdate({
+          target: [
+            requisitions.tenantId,
+            requisitions.mspProgramId,
+            requisitions.requisitionId,
+          ],
+          set: {
+            status: row.status,
+            sourceCustomerName: row.customer,
+            normalizedCustomerName: normalizeCustomerName(row.customer),
+            jobTitle: row.job_title,
+            location: row.location,
+            sourceDuration: row.duration,
+            normalizedDurationWeeks: durationWeeks?.toString() || null,
+            numberOfPositions: row.number_of_positions,
+            submissionCount: row.submissions,
+            activeSubmissionCount: row.active_submissions,
+            displayedVendorRate:
+              row.c2c_bill_rate_normalized || row.c2c_bill_rate?.toString() || null,
+            releasedDate: row.released_date ? new Date(row.released_date) : null,
+            positionType: row.position_type,
+            remoteOrOnsite: row.remote_or_onsite || "Unknown",
+            sourceConfidence: row.source_confidence,
+            dataQualityNotes: row.data_quality_notes || [],
+            lastSeenAt: now,
+            lastAnalyzedAt: now,
+            isNewToday: false,
+            updatedAt: now,
+          },
+        });
+      newRecordsCreated += 1;
     }
 
     // Get the requisition ID
@@ -1040,12 +1287,15 @@ export async function finalizeBatch(
           id: uuidv4(),
           tenantId,
           requisitionId: reqRecord.id,
+          batchId,
           recommendedPayMin: payMin.toString(),
           recommendedPayMax: payMax.toString(),
           payMidpoint: payMidpoint.toString(),
           selectedPayRate: payMidpoint.toString(),
           payScenario: "midpoint",
-          payEstimateReason: analyzedRow.pay_estimate_reason || "",
+          payEstimateReason: payEstimateReason,
+          payRangeConfidence: analyzedRow.pay_range_confidence || "Medium",
+          payRangeFit,
           marketRateWarning: analyzedRow.market_rate_warning || null,
           roleRiskClassification: roleRisk,
           effectiveVendorRate: financials.effectiveVendorRate.toString(),
@@ -1070,11 +1320,14 @@ export async function finalizeBatch(
         .onConflictDoUpdate({
           target: [requisitionAnalysisResults.requisitionId],
           set: {
+            batchId,
             recommendedPayMin: payMin.toString(),
             recommendedPayMax: payMax.toString(),
             payMidpoint: payMidpoint.toString(),
             selectedPayRate: payMidpoint.toString(),
-            payEstimateReason: analyzedRow.pay_estimate_reason || "",
+            payEstimateReason: payEstimateReason,
+            payRangeConfidence: analyzedRow.pay_range_confidence || "Medium",
+            payRangeFit,
             marketRateWarning: analyzedRow.market_rate_warning || null,
             roleRiskClassification: roleRisk,
             effectiveVendorRate: financials.effectiveVendorRate.toString(),
@@ -1097,6 +1350,42 @@ export async function finalizeBatch(
             updatedAt: new Date(),
           },
         });
+
+      analysisRecordsCreated += 1;
+
+      await db.insert(requisitionSnapshots).values({
+        id: uuidv4(),
+        tenantId,
+        requisitionId: reqRecord.id,
+        batchId,
+        sourceValues: row,
+        recommendedPayMin: payMin.toString(),
+        recommendedPayMax: payMax.toString(),
+        payMidpoint: payMidpoint.toString(),
+        selectedPayRate: payMidpoint.toString(),
+        payScenario: "midpoint",
+        payEstimateReason: payEstimateReason,
+        payRangeConfidence: analyzedRow.pay_range_confidence || "Medium",
+        payRangeFit,
+        marketRateWarning: analyzedRow.market_rate_warning || null,
+        roleRiskClassification: roleRisk,
+        effectiveVendorRate: financials.effectiveVendorRate.toString(),
+        estimatedW2Cost: financials.w2CostPerHour.toString(),
+        grossSpreadPerHour: financials.grossSpreadPerHour.toString(),
+        estimatedProfitPerHour: financials.estimatedProfitPerHour.toString(),
+        netMarginPercent: financials.netMarginPercent.toString(),
+        weeklyProfit: financials.weeklyProfit.toString(),
+        assignmentProfit: financials.assignmentProfit?.toString() || null,
+        competitionScore: scores.competitionScore,
+        profitabilityScore: scores.profitabilityScore,
+        fillabilityScore: scores.fillabilityScore,
+        fillabilityLabel: getFillabilityLabel(scores.fillabilityScore),
+        billRateScore: scores.billRateScore,
+        durationScore: scores.durationScore,
+        opportunityScore: scores.opportunityScore,
+        rank: 0,
+        calculatedRecommendation: recommendation,
+      });
 
       results.push({
         id: reqRecord.id,
@@ -1154,6 +1443,13 @@ export async function finalizeBatch(
     analysesPending: 0,
     requiresReview: requiresManualReviewCount,
     excludedCount,
+    newRecordsCreated,
+    existingRecordsUpdated,
+    unchangedExistingRecords,
+    duplicatesConsolidated,
+    possibleDuplicatesRemaining,
+    analysisRecordsCreated,
+    analysisRecordsReused,
   };
 
   await db
@@ -1170,6 +1466,8 @@ export async function finalizeBatch(
     tenant_id: tenantId,
     requisition_count: uniqueRequisitionCount,
     source_row_count: sourceRowCount,
+    new_records_created: newRecordsCreated,
+    existing_records_updated: existingRecordsUpdated,
   });
 
   return {
@@ -1178,6 +1476,13 @@ export async function finalizeBatch(
     analysesCompleted: uniqueRequisitionCount,
     analysesPending: 0,
     requiresReview: requiresManualReviewCount,
+    newRecordsCreated,
+    existingRecordsUpdated,
+    unchangedExistingRecords,
+    duplicatesConsolidated,
+    possibleDuplicatesRemaining,
+    analysisRecordsCreated,
+    analysisRecordsReused,
   };
 }
 
