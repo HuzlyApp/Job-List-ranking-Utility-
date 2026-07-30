@@ -98,6 +98,14 @@ export const ExtractedRequisitionSchema = z.object({
   remote_or_onsite: z.enum(["Remote", "Hybrid", "On-site", "Unknown"]).nullable(),
   source_confidence: z.enum(["High", "Medium", "Low"]),
   data_quality_notes: z.array(z.string()).default([]),
+  /** Original bill-rate text from the source file (e.g. "$70.00") */
+  source_c2c_bill_rate: z.string().nullable().optional(),
+  /** Decimal-safe normalized bill rate string (e.g. "70.00") */
+  c2c_bill_rate_normalized: z.string().nullable().optional(),
+  source_start_date: z.string().nullable().optional(),
+  source_released_date: z.string().nullable().optional(),
+  source_duration: z.string().nullable().optional(),
+  normalized_duration_weeks: z.number().nullable().optional(),
 });
 
 export type ExtractedRequisition = z.infer<typeof ExtractedRequisitionSchema>;

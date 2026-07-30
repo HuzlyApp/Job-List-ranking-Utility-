@@ -123,14 +123,20 @@ export default function ImportPage() {
 
       <main className="max-w-4xl mx-auto px-4 py-8 space-y-6">
         {/* Stepper */}
-        <ol className="flex gap-2 text-sm">
-          {["Upload Files", "Parse and Extract", "Review Data", "Analyze", "Complete"].map(
-            (step, i) => (
+        <ol className="flex flex-wrap gap-2 text-sm">
+          {[
+            "Upload File",
+            "Detect File Format",
+            "Preview Columns",
+            "Review Requisitions",
+            "Analyze With Claude",
+            "View Ranked Results",
+          ].map((step, i) => (
               <li
                 key={step}
                 className={`px-3 py-1 rounded-full ${i === 0 ? "bg-blue-600 text-white" : "bg-gray-200 text-gray-600"}`}
               >
-                {i + 1}. {step}
+                {step}
               </li>
             )
           )}

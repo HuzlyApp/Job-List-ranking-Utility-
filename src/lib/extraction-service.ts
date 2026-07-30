@@ -10,9 +10,17 @@ import {
 } from "@/db/schema";
 import { eq, and, sql } from "drizzle-orm";
 import { v4 as uuidv4 } from "uuid";
+import Decimal from "decimal.js";
 import type { ExtractedRequisition, FinancialAssumptions, ScoringWeights } from "@/types";
 import { createRequisitionIntelligenceService } from "@/lib/ai-providers";
-import { parseSpreadsheet, parseCSV, validateFileType } from "@/lib/file-parsing";
+import {
+  parseSpreadsheet,
+  parseCSVBuffer,
+  validateFileType,
+  CsvReadError,
+  CSV_READ_ERROR,
+  type ImportParseSummary,
+} from "@/lib/file-parsing";
 import { saveUploadFile, loadUploadFile } from "@/lib/file-storage";
 import {
   calculateFinancials,
@@ -149,6 +157,7 @@ export async function processBatchExtraction(
   let spreadsheetRows = 0;
   let imageFiles = 0;
   let spreadsheetFiles = 0;
+  const importSummaries: ImportParseSummary[] = [];
 
   for (const file of files) {
     try {
@@ -176,7 +185,9 @@ export async function processBatchExtraction(
         const parsed = parseSpreadsheet(content, file.originalFilename);
         for (const sheet of parsed) {
           spreadsheetRows += sheet.rows.length;
+          if (sheet.summary) importSummaries.push(sheet.summary);
           for (const row of sheet.rows) {
+            const rowNumMatch = row.source_record_key.match(/row(\d+)$/);
             const enriched = {
               ...row,
               source_file_ids: [file.id],
@@ -188,7 +199,7 @@ export async function processBatchExtraction(
               sourceFileId: file.id,
               sourceRecordKey: enriched.source_record_key,
               sheetName: sheet.sheetName,
-              rowNumber: parseInt(enriched.source_record_key.split(":").pop() || "0", 10) || null,
+              rowNumber: rowNumMatch ? parseInt(rowNumMatch[1], 10) : null,
               extractedJson: enriched,
               sourceConfidence: enriched.source_confidence,
               dataQualityNotes: enriched.data_quality_notes || [],
@@ -209,9 +220,11 @@ export async function processBatchExtraction(
         file.originalFilename.toLowerCase().endsWith(".csv")
       ) {
         spreadsheetFiles++;
-        const parsed = parseCSV(content.toString("utf-8"), file.originalFilename);
+        const parsed = parseCSVBuffer(content, file.originalFilename);
         spreadsheetRows += parsed.rows.length;
+        if (parsed.summary) importSummaries.push(parsed.summary);
         for (const row of parsed.rows) {
+          const rowNumMatch = row.source_record_key.match(/row(\d+)$/);
           const enriched = {
             ...row,
             source_file_ids: [file.id],
@@ -223,6 +236,7 @@ export async function processBatchExtraction(
             sourceFileId: file.id,
             sourceRecordKey: enriched.source_record_key,
             sheetName: parsed.sheetName,
+            rowNumber: rowNumMatch ? parseInt(rowNumMatch[1], 10) : null,
             extractedJson: enriched,
             sourceConfidence: enriched.source_confidence,
             dataQualityNotes: enriched.data_quality_notes || [],
@@ -238,11 +252,19 @@ export async function processBatchExtraction(
           .where(eq(requisitionSourceFiles.id, file.id));
       }
     } catch (err) {
+      const friendly =
+        err instanceof CsvReadError
+          ? CSV_READ_ERROR
+          : err instanceof Error && /unicode|decode|encoding|byte sequence|malformed/i.test(err.message)
+            ? CSV_READ_ERROR
+            : err instanceof Error
+              ? err.message
+              : "We could not process this file. Please try again with a CSV or Excel export.";
       await db
         .update(requisitionSourceFiles)
         .set({
           processingStatus: "failed",
-          errorMessage: err instanceof Error ? err.message : "Processing failed",
+          errorMessage: friendly,
         })
         .where(eq(requisitionSourceFiles.id, file.id));
     }
@@ -304,6 +326,21 @@ export async function processBatchExtraction(
   const allExtracted = allRows.map((r) => r.extractedJson as ExtractedRequisition);
   const duplicatesDetected = detectDuplicates(allExtracted);
   const uncertainCount = allExtracted.filter((r) => r.source_confidence !== "High").length;
+  const missingIds = allExtracted.filter((r) => !r.requisition_id).length;
+  const missingRates = allExtracted.filter(
+    (r) => r.c2c_bill_rate === null || r.c2c_bill_rate === undefined
+  ).length;
+  const dateWarnings = allExtracted.filter((r) =>
+    (r.data_quality_notes || []).some((n) => n.toLowerCase().includes("date"))
+  ).length;
+  const rowsRequiringReview = allExtracted.filter(
+    (r) =>
+      !r.requisition_id ||
+      r.c2c_bill_rate === null ||
+      r.c2c_bill_rate === undefined ||
+      (r.data_quality_notes || []).length > 0 ||
+      r.source_confidence !== "High"
+  ).length;
 
   await db
     .update(requisitionAnalysisBatches)
@@ -316,6 +353,14 @@ export async function processBatchExtraction(
         visible_rows_detected: allExtracted.length,
         potential_duplicates_detected: duplicatesDetected.length,
         uncertain_record_count: uncertainCount,
+        valid_rows: allExtracted.filter(
+          (r) => r.requisition_id && r.c2c_bill_rate !== null && r.c2c_bill_rate !== undefined
+        ).length,
+        rows_requiring_review: rowsRequiringReview,
+        missing_requisition_ids: missingIds,
+        missing_bill_rates: missingRates,
+        date_parsing_warnings: dateWarnings,
+        import_summaries: importSummaries,
       },
     })
     .where(eq(requisitionAnalysisBatches.id, batchId));
@@ -408,12 +453,46 @@ export async function deduplicateRequisitions(
 function mergeDuplicateRows(duplicates: ExtractedRequisition[]): ExtractedRequisition {
   const base = { ...duplicates[0] };
   const dataQualityNotes = [...(base.data_quality_notes || [])];
-  
-  // Merge complementary fields
+
+  // Merge complementary fields — never sum submission counts
   for (let i = 1; i < duplicates.length; i++) {
     const dup = duplicates[i];
-    
-    // Fill missing fields
+
+    const conflictFields: string[] = [];
+    if (dup.customer && base.customer && dup.customer !== base.customer) {
+      conflictFields.push(`customer ("${base.customer}" vs "${dup.customer}")`);
+    }
+    if (dup.job_title && base.job_title && dup.job_title !== base.job_title) {
+      conflictFields.push(`job_title`);
+    }
+    if (
+      dup.c2c_bill_rate != null &&
+      base.c2c_bill_rate != null &&
+      dup.c2c_bill_rate !== base.c2c_bill_rate
+    ) {
+      conflictFields.push(
+        `bill_rate (${base.c2c_bill_rate} vs ${dup.c2c_bill_rate})`
+      );
+    }
+    if (
+      dup.submissions != null &&
+      base.submissions != null &&
+      dup.submissions !== base.submissions
+    ) {
+      conflictFields.push(
+        `submissions (${base.submissions} vs ${dup.submissions}; kept higher, not summed)`
+      );
+    }
+    if (
+      dup.active_submissions != null &&
+      base.active_submissions != null &&
+      dup.active_submissions !== base.active_submissions
+    ) {
+      conflictFields.push(
+        `active_submissions (${base.active_submissions} vs ${dup.active_submissions}; kept higher, not summed)`
+      );
+    }
+
     if (!base.customer && dup.customer) base.customer = dup.customer;
     if (!base.job_title && dup.job_title) base.job_title = dup.job_title;
     if (!base.location && dup.location) base.location = dup.location;
@@ -422,16 +501,30 @@ function mergeDuplicateRows(duplicates: ExtractedRequisition[]): ExtractedRequis
     if (!base.remote_or_onsite || base.remote_or_onsite === "Unknown") {
       base.remote_or_onsite = dup.remote_or_onsite;
     }
-    
-    // Use most recent submission count (higher is usually more recent)
-    if (dup.submissions && (!base.submissions || dup.submissions > base.submissions)) {
+    if (base.c2c_bill_rate == null && dup.c2c_bill_rate != null) {
+      base.c2c_bill_rate = dup.c2c_bill_rate;
+      base.c2c_bill_rate_normalized = dup.c2c_bill_rate_normalized;
+      base.source_c2c_bill_rate = dup.source_c2c_bill_rate;
+    }
+
+    // Prefer higher counts — never add them together
+    if (dup.submissions != null && (base.submissions == null || dup.submissions > base.submissions)) {
       base.submissions = dup.submissions;
     }
-    
-    // Track that this was merged
+    if (
+      dup.active_submissions != null &&
+      (base.active_submissions == null || dup.active_submissions > base.active_submissions)
+    ) {
+      base.active_submissions = dup.active_submissions;
+    }
+
     dataQualityNotes.push(`Merged from duplicate occurrence: ${dup.source_record_key}`);
+    if (conflictFields.length > 0) {
+      dataQualityNotes.push(`Conflicting values recorded: ${conflictFields.join("; ")}`);
+      base.source_confidence = "Medium";
+    }
   }
-  
+
   base.data_quality_notes = dataQualityNotes;
   return base;
 }
@@ -711,7 +804,8 @@ export async function finalizeBatch(
     const payMidpoint = (payMin + payMax) / 2;
 
     // Parse duration
-    const durationWeeks = parseDurationToWeeks(row.duration);
+    const durationWeeks =
+      row.normalized_duration_weeks ?? parseDurationToWeeks(row.duration);
 
     // Determine role risk
     let roleRisk: "Standard" | "Higher-Risk Technical" | "Healthcare" = "Standard";
@@ -736,7 +830,9 @@ export async function finalizeBatch(
     
     try {
       financials = calculateFinancials({
-        displayedVendorRate: row.c2c_bill_rate || 0,
+        displayedVendorRate: new Decimal(
+          row.c2c_bill_rate_normalized || row.c2c_bill_rate || 0
+        ),
         selectedPayRate: payMidpoint,
         vendorFeeType: program.vendorFeeType as "percentage" | "flat_hourly" | "none",
         vendorFeeValue: parseFloat(program.vendorFeeValue),
@@ -750,7 +846,9 @@ export async function finalizeBatch(
         requiresHealthcareReview = true;
         // Recalculate with standard rate
         financials = calculateFinancials({
-          displayedVendorRate: row.c2c_bill_rate || 0,
+          displayedVendorRate: new Decimal(
+            row.c2c_bill_rate_normalized || row.c2c_bill_rate || 0
+          ),
           selectedPayRate: payMidpoint,
           vendorFeeType: program.vendorFeeType as "percentage" | "flat_hourly" | "none",
           vendorFeeValue: parseFloat(program.vendorFeeValue),
@@ -805,7 +903,8 @@ export async function finalizeBatch(
           numberOfPositions: row.number_of_positions,
           submissionCount: row.submissions,
           activeSubmissionCount: row.active_submissions,
-          displayedVendorRate: row.c2c_bill_rate?.toString() || null,
+          displayedVendorRate:
+            row.c2c_bill_rate_normalized || row.c2c_bill_rate?.toString() || null,
           releasedDate: row.released_date ? new Date(row.released_date) : null,
           positionType: row.position_type,
           remoteOrOnsite: row.remote_or_onsite || "Unknown",
@@ -834,7 +933,8 @@ export async function finalizeBatch(
         numberOfPositions: row.number_of_positions,
         submissionCount: row.submissions,
         activeSubmissionCount: row.active_submissions,
-        displayedVendorRate: row.c2c_bill_rate?.toString() || null,
+        displayedVendorRate:
+          row.c2c_bill_rate_normalized || row.c2c_bill_rate?.toString() || null,
         releasedDate: row.released_date ? new Date(row.released_date) : null,
         positionType: row.position_type,
         remoteOrOnsite: row.remote_or_onsite || "Unknown",
