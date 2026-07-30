@@ -35,25 +35,17 @@ export function DashboardTopbar({ pageTitle, breadcrumbs, onMenuClick }: Dashboa
 
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
+      // Capture-phase so Chrome/Edge don't steal Ctrl+K for the omnibox.
       if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "k") {
-        const target = event.target as HTMLElement | null;
-        const tag = target?.tagName;
-        if (
-          tag === "INPUT" ||
-          tag === "TEXTAREA" ||
-          tag === "SELECT" ||
-          target?.isContentEditable
-        ) {
-          // Still allow Cmd/Ctrl+K to open search from form fields
-        }
         event.preventDefault();
+        event.stopPropagation();
         setSearchOpen((open) => !open);
         setUserMenuOpen(false);
       }
     };
 
-    document.addEventListener("keydown", onKeyDown);
-    return () => document.removeEventListener("keydown", onKeyDown);
+    document.addEventListener("keydown", onKeyDown, true);
+    return () => document.removeEventListener("keydown", onKeyDown, true);
   }, []);
 
   return (
