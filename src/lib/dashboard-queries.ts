@@ -7,6 +7,7 @@ import {
   asc,
   sql,
   ilike,
+  inArray,
   type SQL,
 } from "drizzle-orm";
 
@@ -28,6 +29,9 @@ export interface RequisitionListParams {
   maxOpportunityScore?: number;
   customer?: string;
   isNewToday?: boolean;
+  isNoLongerVisible?: boolean;
+  negativeProfit?: boolean;
+  highPriority?: boolean;
   page: number;
   limit: number;
   sortBy: RequisitionListSortBy;
@@ -49,6 +53,10 @@ export async function listRequisitionsWithAnalysis(params: RequisitionListParams
   const [{ count }] = await db
     .select({ count: sql<number>`count(*)::int` })
     .from(requisitions)
+    .leftJoin(
+      requisitionAnalysisResults,
+      eq(requisitions.id, requisitionAnalysisResults.requisitionId)
+    )
     .where(whereClause);
 
   const sortFn = params.sortOrder === "desc" ? desc : asc;
@@ -142,37 +150,7 @@ export async function listRequisitionsWithAnalysis(params: RequisitionListParams
     .limit(params.limit)
     .offset(offset);
 
-  let mapped = (rows as JoinedRequisitionRow[]).map(mapJoinedRow);
-
-  if (
-    params.minOpportunityScore !== undefined ||
-    params.maxOpportunityScore !== undefined
-  ) {
-    mapped = mapped.filter((r) => {
-      const score = r.analysis?.opportunityScore;
-      if (score === null || score === undefined) return true;
-      if (
-        params.minOpportunityScore !== undefined &&
-        score < params.minOpportunityScore
-      ) {
-        return false;
-      }
-      if (
-        params.maxOpportunityScore !== undefined &&
-        score > params.maxOpportunityScore
-      ) {
-        return false;
-      }
-      return true;
-    });
-  }
-
-  if (params.recommendation) {
-    mapped = mapped.filter(
-      (r) => r.analysis?.finalRecommendation === params.recommendation
-    );
-  }
-
+  const mapped = (rows as JoinedRequisitionRow[]).map(mapJoinedRow);
   const total = Number(count) || 0;
 
   return {
@@ -249,6 +227,48 @@ function buildRequisitionWhere(params: RequisitionListParams): SQL | undefined {
   }
   if (params.isNewToday !== undefined) {
     whereConditions.push(eq(requisitions.isNewToday, params.isNewToday));
+  }
+  if (params.isNoLongerVisible !== undefined) {
+    whereConditions.push(
+      eq(requisitions.isNoLongerVisible, params.isNoLongerVisible)
+    );
+  }
+  if (params.highPriority) {
+    whereConditions.push(
+      inArray(requisitionAnalysisResults.finalRecommendation, [
+        "Recruit Immediately",
+        "High Priority",
+      ])
+    );
+  }
+  if (params.negativeProfit) {
+    whereConditions.push(
+      sql`${requisitionAnalysisResults.estimatedProfitPerHour} is not null and ${requisitionAnalysisResults.estimatedProfitPerHour}::numeric < 0`
+    );
+  }
+  if (params.recommendation) {
+    whereConditions.push(
+      eq(
+        requisitionAnalysisResults.finalRecommendation,
+        params.recommendation as
+          | "Recruit Immediately"
+          | "High Priority"
+          | "Good Opportunity"
+          | "Candidate Driven"
+          | "Only If Candidate Available"
+          | "Skip or Monitor"
+      )
+    );
+  }
+  if (params.minOpportunityScore !== undefined) {
+    whereConditions.push(
+      sql`${requisitionAnalysisResults.opportunityScore} >= ${params.minOpportunityScore}`
+    );
+  }
+  if (params.maxOpportunityScore !== undefined) {
+    whereConditions.push(
+      sql`${requisitionAnalysisResults.opportunityScore} <= ${params.maxOpportunityScore}`
+    );
   }
 
   return whereConditions.length > 0 ? and(...whereConditions) : undefined;

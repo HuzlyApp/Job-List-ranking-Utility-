@@ -78,7 +78,37 @@ interface DashboardData {
     limit: number;
     totalPages: number;
   };
+  kpis?: {
+    totalRequisitions: number;
+    newToday: number;
+    highPriority: number;
+    negativeProfit: number;
+    noLongerVisible: number;
+    averageOpportunityScore: number | null;
+  } | null;
 }
+
+const EMPTY_FILTERS: FilterState = {
+  search: "",
+  status: "",
+  recommendation: "",
+  minScore: "",
+  maxScore: "",
+  customer: "",
+  isNewToday: false,
+  isNoLongerVisible: false,
+  negativeProfit: false,
+  highPriority: false,
+};
+
+type KpiTile =
+  | "total"
+  | "newToday"
+  | "highPriority"
+  | "negativeProfit"
+  | "noLongerVisible"
+  | "avgScore";
+
 
 interface ImportBatch {
   id: string;
@@ -120,15 +150,9 @@ export function Dashboard() {
   const [error, setError] = useState<string | null>(null);
   const [selectedRequisition, setSelectedRequisition] = useState<RequisitionWithAnalysis | null>(null);
   const [page, setPage] = useState(1);
-  const [filters, setFilters] = useState<FilterState>({
-    search: "",
-    status: "",
-    recommendation: "",
-    minScore: "",
-    maxScore: "",
-    customer: "",
-    isNewToday: false,
-  });
+  const [sortBy, setSortBy] = useState<"rank" | "opportunityScore">("rank");
+  const [sortOrder, setSortOrder] = useState<"asc" | "desc">("asc");
+  const [filters, setFilters] = useState<FilterState>(EMPTY_FILTERS);
 
   // Fetch functions defined with useCallback
   const fetchRequisitions = useCallback(async () => {
@@ -139,8 +163,8 @@ export function Dashboard() {
       params.append("tenantId", tenantId);
       params.append("page", String(page));
       params.append("limit", "20");
-      params.append("sortBy", "rank");
-      params.append("sortOrder", "asc");
+      params.append("sortBy", sortBy);
+      params.append("sortOrder", sortOrder);
 
       if (filters.status) params.append("status", filters.status);
       if (filters.recommendation) params.append("recommendation", filters.recommendation);
@@ -149,6 +173,9 @@ export function Dashboard() {
       if (filters.customer) params.append("customer", filters.customer);
       if (filters.search) params.append("customer", filters.search);
       if (filters.isNewToday) params.append("isNewToday", "true");
+      if (filters.isNoLongerVisible) params.append("isNoLongerVisible", "true");
+      if (filters.negativeProfit) params.append("negativeProfit", "true");
+      if (filters.highPriority) params.append("highPriority", "true");
 
       const response = await fetch(`/api/requisitions?${params}`, {
         cache: "no-store",
@@ -162,7 +189,7 @@ export function Dashboard() {
     } finally {
       setLoading(false);
     }
-  }, [tenantId, page, filters]);
+  }, [tenantId, page, filters, sortBy, sortOrder]);
 
   const fetchBatches = useCallback(async () => {
     setBatchesLoading(true);
@@ -258,14 +285,74 @@ export function Dashboard() {
 
   const kpis = useMemo(() => {
     return {
-      totalRequisitions: data?.pagination?.total ?? 0,
-      newToday: 0,
-      highPriority: 0,
-      negativeProfit: 0,
-      noLongerVisible: 0,
-      avgScore: 0,
+      totalRequisitions:
+        data?.kpis?.totalRequisitions ?? data?.pagination?.total ?? 0,
+      newToday: data?.kpis?.newToday ?? 0,
+      highPriority: data?.kpis?.highPriority ?? 0,
+      negativeProfit: data?.kpis?.negativeProfit ?? 0,
+      noLongerVisible: data?.kpis?.noLongerVisible ?? 0,
+      avgScore: data?.kpis?.averageOpportunityScore ?? 0,
     };
   }, [data]);
+
+  const activeKpi: KpiTile | null = useMemo(() => {
+    if (filters.isNewToday) return "newToday";
+    if (filters.highPriority) return "highPriority";
+    if (filters.negativeProfit) return "negativeProfit";
+    if (filters.isNoLongerVisible) return "noLongerVisible";
+    if (sortBy === "opportunityScore") return "avgScore";
+    if (
+      !filters.search &&
+      !filters.status &&
+      !filters.recommendation &&
+      !filters.minScore &&
+      !filters.maxScore &&
+      !filters.customer
+    ) {
+      return "total";
+    }
+    return null;
+  }, [filters, sortBy]);
+
+  const applyKpiFilter = (tile: KpiTile) => {
+    setPage(1);
+
+    if (activeKpi === tile && tile !== "total") {
+      setFilters(EMPTY_FILTERS);
+      setSortBy("rank");
+      setSortOrder("asc");
+    } else if (tile === "total") {
+      setFilters(EMPTY_FILTERS);
+      setSortBy("rank");
+      setSortOrder("asc");
+    } else if (tile === "newToday") {
+      setFilters({ ...EMPTY_FILTERS, isNewToday: true });
+      setSortBy("rank");
+      setSortOrder("asc");
+    } else if (tile === "highPriority") {
+      setFilters({ ...EMPTY_FILTERS, highPriority: true });
+      setSortBy("rank");
+      setSortOrder("asc");
+    } else if (tile === "negativeProfit") {
+      setFilters({ ...EMPTY_FILTERS, negativeProfit: true });
+      setSortBy("rank");
+      setSortOrder("asc");
+    } else if (tile === "noLongerVisible") {
+      setFilters({ ...EMPTY_FILTERS, isNoLongerVisible: true });
+      setSortBy("rank");
+      setSortOrder("asc");
+    } else if (tile === "avgScore") {
+      setFilters(EMPTY_FILTERS);
+      setSortBy("opportunityScore");
+      setSortOrder("desc");
+    }
+
+    requestAnimationFrame(() => {
+      document
+        .getElementById("requisition-list")
+        ?.scrollIntoView({ behavior: "smooth", block: "start" });
+    });
+  };
 
   const quickInsights = useMemo(() => {
     if (!data?.requisitions?.length) return null;
@@ -332,21 +419,20 @@ export function Dashboard() {
     filters.minScore ||
     filters.maxScore ||
     filters.customer ||
-    filters.isNewToday;
+    filters.isNewToday ||
+    filters.isNoLongerVisible ||
+    filters.negativeProfit ||
+    filters.highPriority ||
+    sortBy !== "rank";
 
   const clearFilters = () => {
-    setFilters({
-      search: "",
-      status: "",
-      recommendation: "",
-      minScore: "",
-      maxScore: "",
-      customer: "",
-      isNewToday: false,
-    });
+    setFilters(EMPTY_FILTERS);
+    setSortBy("rank");
+    setSortOrder("asc");
   };
 
-  const hasRequisitions = (data?.pagination?.total ?? 0) > 0;
+  const hasRequisitions =
+    (data?.kpis?.totalRequisitions ?? data?.pagination?.total ?? 0) > 0;
   const hasProcessingBatches = batches.some((b) => b.status === "processing");
   const hasAwaitingReviewBatches = batches.some((b) => b.status === "awaiting_review");
   const hasFailedBatches = batches.some((b) => b.status === "failed");
@@ -424,6 +510,8 @@ export function Dashboard() {
                 value={kpis.totalRequisitions.toLocaleString()}
                 icon={<BriefcaseIcon className="w-5 h-5" />}
                 isLoading={loading}
+                onClick={() => applyKpiFilter("total")}
+                active={activeKpi === "total"}
               />
               <StatCard
                 title="New Today"
@@ -431,6 +519,8 @@ export function Dashboard() {
                 icon={<SparklesIcon className="w-5 h-5" />}
                 accent="success"
                 isLoading={loading}
+                onClick={() => applyKpiFilter("newToday")}
+                active={activeKpi === "newToday"}
               />
               <StatCard
                 title="High Priority"
@@ -438,6 +528,8 @@ export function Dashboard() {
                 icon={<TargetIcon className="w-5 h-5" />}
                 accent="success"
                 isLoading={loading}
+                onClick={() => applyKpiFilter("highPriority")}
+                active={activeKpi === "highPriority"}
               />
               <StatCard
                 title="Negative Profit"
@@ -445,6 +537,8 @@ export function Dashboard() {
                 icon={<AlertTriangleIcon className="w-5 h-5" />}
                 accent={kpis.negativeProfit > 0 ? "danger" : "default"}
                 isLoading={loading}
+                onClick={() => applyKpiFilter("negativeProfit")}
+                active={activeKpi === "negativeProfit"}
               />
               <StatCard
                 title="No Longer Visible"
@@ -452,6 +546,8 @@ export function Dashboard() {
                 icon={<EyeOffIcon className="w-5 h-5" />}
                 accent={kpis.noLongerVisible > 0 ? "warning" : "default"}
                 isLoading={loading}
+                onClick={() => applyKpiFilter("noLongerVisible")}
+                active={activeKpi === "noLongerVisible"}
               />
               <StatCard
                 title="Avg Score"
@@ -459,6 +555,8 @@ export function Dashboard() {
                 icon={<GaugeIcon className="w-5 h-5" />}
                 description="Opportunity score"
                 isLoading={loading}
+                onClick={() => applyKpiFilter("avgScore")}
+                active={activeKpi === "avgScore"}
               />
             </div>
 
@@ -484,7 +582,7 @@ export function Dashboard() {
             </div>
 
             {/* Content Area */}
-            <div className="space-y-6">
+            <div id="requisition-list" className="space-y-6 scroll-mt-20">
               {!hasRequisitions && !loading && (
                 <>
                   {hasProcessingBatches && <ProcessingEmptyState />}
@@ -504,11 +602,11 @@ export function Dashboard() {
                 </>
               )}
               
-              {hasActiveFilters && data?.requisitions.length === 0 && (
+              {hasRequisitions && hasActiveFilters && data?.requisitions.length === 0 && !loading && (
                 <FilteredEmptyState onClearFilters={clearFilters} />
               )}
               
-              {(hasRequisitions || loading) && (
+              {(hasRequisitions || loading) && !(hasActiveFilters && data?.requisitions.length === 0 && !loading) && (
                 <RequisitionTable
                   data={data}
                   onPageChange={setPage}

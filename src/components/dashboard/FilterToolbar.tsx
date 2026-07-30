@@ -15,6 +15,9 @@ export interface FilterState {
   maxScore: string;
   customer: string;
   isNewToday: boolean;
+  isNoLongerVisible: boolean;
+  negativeProfit: boolean;
+  highPriority: boolean;
 }
 
 interface FilterToolbarProps {
@@ -51,6 +54,9 @@ export function FilterToolbar({ filters, onChange, customers }: FilterToolbarPro
     filters.maxScore,
     filters.customer,
     filters.isNewToday,
+    filters.isNoLongerVisible,
+    filters.negativeProfit,
+    filters.highPriority,
   ].filter(Boolean).length;
 
   const handleClearFilters = () => {
@@ -62,6 +68,9 @@ export function FilterToolbar({ filters, onChange, customers }: FilterToolbarPro
       maxScore: "",
       customer: "",
       isNewToday: false,
+      isNoLongerVisible: false,
+      negativeProfit: false,
+      highPriority: false,
     });
   };
 
@@ -229,6 +238,24 @@ export function FilterToolbar({ filters, onChange, customers }: FilterToolbarPro
             <FilterChip
               label="New Today"
               onRemove={() => onChange({ ...filters, isNewToday: false })}
+            />
+          )}
+          {filters.highPriority && (
+            <FilterChip
+              label="High Priority"
+              onRemove={() => onChange({ ...filters, highPriority: false })}
+            />
+          )}
+          {filters.negativeProfit && (
+            <FilterChip
+              label="Negative Profit"
+              onRemove={() => onChange({ ...filters, negativeProfit: false })}
+            />
+          )}
+          {filters.isNoLongerVisible && (
+            <FilterChip
+              label="No Longer Visible"
+              onRemove={() => onChange({ ...filters, isNoLongerVisible: false })}
             />
           )}
         </div>

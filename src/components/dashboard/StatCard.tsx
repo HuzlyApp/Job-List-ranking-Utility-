@@ -15,6 +15,8 @@ interface StatCardProps {
   };
   accent?: "default" | "success" | "warning" | "danger" | "info";
   isLoading?: boolean;
+  onClick?: () => void;
+  active?: boolean;
 }
 
 const accentStyles = {
@@ -48,6 +50,8 @@ export function StatCard({
   change,
   accent = "default",
   isLoading = false,
+  onClick,
+  active = false,
 }: StatCardProps) {
   const styles = accentStyles[accent];
 
@@ -68,8 +72,18 @@ export function StatCard({
     );
   }
 
-  return (
-    <div className="bg-white rounded-xl border border-slate-300 p-5 shadow-sm hover:shadow-md transition-shadow">
+  const className = `w-full text-left bg-white rounded-xl border p-5 shadow-sm transition-all ${
+    onClick
+      ? "cursor-pointer hover:shadow-md hover:border-emerald-300 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500 focus-visible:ring-offset-2"
+      : "hover:shadow-md"
+  } ${
+    active
+      ? "border-emerald-500 ring-2 ring-emerald-100 shadow-md"
+      : "border-slate-300"
+  }`;
+
+  const content = (
+    <>
       <div className="flex items-start justify-between">
         <div className="flex-1 min-w-0">
           <p className="text-sm font-bold text-slate-700 truncate">{title}</p>
@@ -81,11 +95,11 @@ export function StatCard({
           <span className={styles.iconColor}>{icon}</span>
         </div>
       </div>
-      
+
       <div className="mt-3 flex items-center gap-2">
         {change && (
           <span className={`inline-flex items-center gap-1 text-xs font-bold
-            ${change.trend === "up" ? "text-emerald-700" : 
+            ${change.trend === "up" ? "text-emerald-700" :
               change.trend === "down" ? "text-red-700" : "text-slate-600"}
           `}>
             {change.trend === "up" && <TrendingUpIcon className="w-3.5 h-3.5" />}
@@ -99,9 +113,29 @@ export function StatCard({
             {change?.label || description}
           </span>
         )}
+        {onClick && (
+          <span className="ml-auto text-[10px] font-bold uppercase tracking-wide text-slate-500">
+            {active ? "Active" : "Filter"}
+          </span>
+        )}
       </div>
-    </div>
+    </>
   );
+
+  if (onClick) {
+    return (
+      <button
+        type="button"
+        onClick={onClick}
+        aria-pressed={active}
+        className={className}
+      >
+        {content}
+      </button>
+    );
+  }
+
+  return <div className={className}>{content}</div>;
 }
 
 // Skeleton loader for stat cards

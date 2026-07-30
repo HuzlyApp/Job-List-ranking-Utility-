@@ -25,6 +25,9 @@ const querySchema = z.object({
   maxOpportunityScore: z.coerce.number().min(0).max(100).optional(),
   customer: z.string().optional(),
   isNewToday: z.boolean().optional(),
+  isNoLongerVisible: z.boolean().optional(),
+  negativeProfit: z.boolean().optional(),
+  highPriority: z.boolean().optional(),
   page: z.number().int().min(1).default(1),
   limit: z.number().int().min(1).max(100).default(20),
   sortBy: z
@@ -60,6 +63,15 @@ export async function GET(request: NextRequest) {
       customer: optionalQueryParam(searchParams.get("customer")),
       isNewToday: searchParams.has("isNewToday")
         ? searchParams.get("isNewToday") === "true"
+        : undefined,
+      isNoLongerVisible: searchParams.has("isNoLongerVisible")
+        ? searchParams.get("isNoLongerVisible") === "true"
+        : undefined,
+      negativeProfit: searchParams.has("negativeProfit")
+        ? searchParams.get("negativeProfit") === "true"
+        : undefined,
+      highPriority: searchParams.has("highPriority")
+        ? searchParams.get("highPriority") === "true"
         : undefined,
       page: coercePositiveInt(searchParams.get("page"), 1, { min: 1 }),
       limit: coercePositiveInt(searchParams.get("limit"), 20, { min: 1, max: 100 }),
