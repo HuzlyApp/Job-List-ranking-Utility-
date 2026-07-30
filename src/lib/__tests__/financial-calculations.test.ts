@@ -46,6 +46,7 @@ describe("Financial Calculations", () => {
       overheadHourly: 0.75,
       benefitsHourly: 0.0,
       ptoHourly: 0.0,
+      otherHourlyCosts: 0.0,
     };
 
     it("should calculate W-2 cost for standard role", () => {
@@ -89,6 +90,7 @@ describe("Financial Calculations", () => {
       overheadHourly: 0.75,
       benefitsHourly: 0.0,
       ptoHourly: 0.0,
+      otherHourlyCosts: 0.0,
     };
 
     it("should calculate all financial metrics", () => {

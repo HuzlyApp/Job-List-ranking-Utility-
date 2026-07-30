@@ -59,6 +59,7 @@ export async function ensureSeedData() {
       vendorFeeType: "percentage",
       vendorFeeValue: "2.00",
       defaultWeeklyHours: 40,
+      createdBy: DEFAULT_USER_ID,
     });
   }
 
@@ -86,7 +87,13 @@ export async function ensureSeedData() {
     await db.insert(scoringWeights).values({
       tenantId: DEFAULT_TENANT_ID,
       mspProgramId: DEFAULT_MSP_PROGRAM_ID,
+      version: 1,
       name: "Default Weights",
+      competitionWeight: 30,
+      profitabilityWeight: 25,
+      fillabilityWeight: 20,
+      billRateWeight: 15,
+      durationWeight: 10,
       createdBy: DEFAULT_USER_ID,
     });
   }

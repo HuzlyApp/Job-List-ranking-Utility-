@@ -1,0 +1,6 @@
+Status,Requisition ID,Customer,Job Title,Submission Count,Bill Rate,Location,Start Date,Duration,Number of Positions,Active Submissions,Released Date,Position Type
+Open,161867,LTI Mindtree US - Local,Product Owner - OHTL,0,$70.00,"Overland Park, KS",7/28/2026,5 months,1,0,7/28/2026,Contract position
+Open,161863,Acme Corp,Senior Developer,1,$74.37,"Austin, TX",8/17/2026,4 months,1,0,8/3/2026,Contract position
+Open,161870,Fidelity,Business Analyst,2,$52.00,"New York, NY",8/3/2026,10 months,2,1,8/3/2026,Contract position
+Open,161805,Contoso Healthcare,Controls Engineer,3,$95.00,"Chicago, IL",9/1/2026,6 months,1,1,8/15/2026,Contract position
+Open,161691,Northwind IT,Scrum Master,0,$68.50,Remote,8/10/2026,12 months,1,0,8/1/2026,Contract position

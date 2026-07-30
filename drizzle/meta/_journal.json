@@ -8,6 +8,20 @@
       "when": 1785146458650,
       "tag": "0000_absent_sandman",
       "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "7",
+      "when": 1785435217286,
+      "tag": "0001_schema_hardening",
+      "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "7",
+      "when": 1785435300000,
+      "tag": "0002_check_constraints",
+      "breakpoints": true
     }
   ]
 }

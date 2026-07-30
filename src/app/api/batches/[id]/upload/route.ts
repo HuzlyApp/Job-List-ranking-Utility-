@@ -1,4 +1,4 @@
-import { NextRequest, NextResponse } from "next/server";
+import { NextRequest, NextResponse, after } from "next/server";
 import { z } from "zod";
 import {
   uploadSourceFile,
@@ -74,10 +74,37 @@ export async function POST(
       );
     }
 
-    // Start extraction asynchronously — client polls status
-    void processBatchExtraction(batchId, meta.tenantId).catch((err) => {
-      console.error("Background extraction failed:", err);
+    const onlySpreadsheets = files.every((f) => {
+      const name = f.name.toLowerCase();
+      return name.endsWith(".csv") || name.endsWith(".xlsx") || name.endsWith(".xls");
     });
+
+    if (onlySpreadsheets) {
+      // CSV/XLSX parse is fast — finish before responding so the progress page
+      // lands on awaiting_review instead of getting stuck mid-poll on serverless.
+      try {
+        await processBatchExtraction(batchId, meta.tenantId);
+      } catch (err) {
+        console.error("Extraction failed:", err);
+        return NextResponse.json({
+          batchId,
+          uploaded: successful.length,
+          failed: uploadResults.filter((r) => r.error).length,
+          results: uploadResults,
+          extractionError:
+            err instanceof Error ? err.message : "We could not process this file.",
+        });
+      }
+    } else {
+      // Screenshots may need Claude — continue after the response is sent.
+      after(async () => {
+        try {
+          await processBatchExtraction(batchId, meta.tenantId);
+        } catch (err) {
+          console.error("Background extraction failed:", err);
+        }
+      });
+    }
 
     return NextResponse.json({
       batchId,

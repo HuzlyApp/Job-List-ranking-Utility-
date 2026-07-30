@@ -90,6 +90,7 @@ export const mspPrograms = pgTable("msp_programs", {
   defaultWeeklyHours: integer("default_weekly_hours").notNull().default(40),
   currency: varchar("currency", { length: 3 }).notNull().default("USD"),
   isActive: boolean("is_active").notNull().default(true),
+  createdBy: uuid("created_by").references(() => users.id),
   createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
   updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow().notNull(),
 }, (table) => [index("msp_programs_tenant_idx").on(table.tenantId)]);
@@ -119,11 +120,12 @@ export const financialAssumptionSets = pgTable("financial_assumption_sets", {
   createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
 }, (table) => [index("assumption_sets_tenant_idx").on(table.tenantId)]);
 
-// Scoring Weights table
+// Scoring Weights table (opportunity score config — repo naming)
 export const scoringWeights = pgTable("scoring_weights", {
   id: uuid("id").primaryKey().defaultRandom(),
   tenantId: uuid("tenant_id").references(() => tenants.id).notNull(),
   mspProgramId: uuid("msp_program_id").references(() => mspPrograms.id).notNull(),
+  version: integer("version").notNull().default(1),
   name: varchar("name", { length: 255 }).notNull(),
   competitionWeight: integer("competition_weight").notNull().default(30),
   profitabilityWeight: integer("profitability_weight").notNull().default(25),
@@ -161,6 +163,7 @@ export const requisitionAnalysisBatches = pgTable("requisition_analysis_batches"
 }, (table) => [
   index("batches_tenant_idx").on(table.tenantId),
   index("batches_status_idx").on(table.status),
+  index("batches_program_status_idx").on(table.tenantId, table.mspProgramId, table.status),
 ]);
 
 // Requisition Source Files table
@@ -173,6 +176,7 @@ export const requisitionSourceFiles = pgTable("requisition_source_files", {
   mimeType: varchar("mime_type", { length: 100 }).notNull(),
   fileSize: integer("file_size").notNull(),
   checksum: varchar("checksum", { length: 64 }),
+  detectedEncoding: varchar("detected_encoding", { length: 50 }),
   pageOrSheetCount: integer("page_or_sheet_count"),
   processingStatus: varchar("processing_status", { length: 50 }).notNull().default("pending"),
   errorMessage: text("error_message"),
@@ -254,9 +258,15 @@ export const requisitions = pgTable("requisitions", {
   index("requisitions_req_id_idx").on(table.requisitionId),
   index("requisitions_customer_idx").on(table.normalizedCustomerName),
   index("requisitions_last_seen_idx").on(table.lastSeenAt),
+  index("requisitions_first_seen_idx").on(table.firstSeenAt),
+  index("requisitions_last_analyzed_idx").on(table.lastAnalyzedAt),
+  index("requisitions_released_idx").on(table.releasedDate),
+  index("requisitions_status_idx").on(table.status),
   index("requisitions_recruiter_idx").on(table.recruiterOwnerId),
   index("requisitions_is_new_idx").on(table.isNewToday),
   index("requisitions_is_no_longer_visible_idx").on(table.isNoLongerVisible),
+  index("requisitions_tenant_program_status_idx").on(table.tenantId, table.mspProgramId, table.status),
+  index("requisitions_recruiter_status_idx").on(table.tenantId, table.recruiterOwnerId, table.recruitingStatus),
   uniqueIndex("requisitions_unique_idx").on(table.tenantId, table.mspProgramId, table.requisitionId),
 ]);
 
@@ -316,6 +326,7 @@ export const requisitionAnalysisResults = pgTable("requisition_analysis_results"
   id: uuid("id").primaryKey().defaultRandom(),
   tenantId: uuid("tenant_id").references(() => tenants.id).notNull(),
   requisitionId: uuid("requisition_id").references(() => requisitions.id).notNull().unique(),
+  batchId: uuid("batch_id").references(() => requisitionAnalysisBatches.id),
 
   // Pay estimates
   recommendedPayMin: decimal("recommended_pay_min", { precision: 10, scale: 2 }),
@@ -358,9 +369,11 @@ export const requisitionAnalysisResults = pgTable("requisition_analysis_results"
   updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow().notNull(),
 }, (table) => [
   index("results_requisition_idx").on(table.requisitionId),
+  index("results_batch_idx").on(table.batchId),
   index("results_opportunity_score_idx").on(table.opportunityScore),
   index("results_rank_idx").on(table.rank),
   index("results_final_recommendation_idx").on(table.finalRecommendation),
+  index("results_tenant_opportunity_idx").on(table.tenantId, table.opportunityScore),
 ]);
 
 // Requisition Overrides table

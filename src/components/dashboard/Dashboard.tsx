@@ -1,10 +1,34 @@
 "use client";
 
-import { useState, useEffect } from "react";
+import { useState, useEffect, useMemo, useCallback } from "react";
 import Link from "next/link";
-import { RequisitionTable } from "./RequisitionTable";
-import { KPICards } from "./KPICards";
-import { Filters } from "./Filters";
+import { useRouter, useSearchParams } from "next/navigation";
+import { DashboardSidebar } from "./DashboardSidebar";
+import { DashboardTopbar } from "./DashboardTopbar";
+import { StatCard } from "./StatCard";
+import { FilterToolbar, FilterState } from "./FilterToolbar";
+import {
+  EmptyState,
+  FilteredEmptyState,
+  ProcessingEmptyState,
+  AwaitingReviewEmptyState,
+  FailedImportEmptyState,
+} from "./EmptyState";
+import { ImportActivityList } from "./ImportActivityList";
+import { QuickInsights } from "./QuickInsights";
+import { RequisitionTable } from "./RequisitionTableNew";
+import { DetailDrawer } from "./DetailDrawer";
+import { ExportMenu } from "./ExportMenu";
+import { ClearDataButton } from "./ClearDataButton";
+import {
+  BriefcaseIcon,
+  SparklesIcon,
+  TargetIcon,
+  AlertTriangleIcon,
+  EyeOffIcon,
+  GaugeIcon,
+  UploadIcon,
+} from "@/components/ui/icons";
 import { useAppContext } from "@/lib/app-context";
 
 interface RequisitionWithAnalysis {
@@ -25,8 +49,8 @@ interface RequisitionWithAnalysis {
     sourceConfidence: string;
     isNewToday: boolean;
     isNoLongerVisible: boolean;
-    firstSeenAt: Date;
-    lastSeenAt: Date;
+    firstSeenAt: string;
+    lastSeenAt: string;
   };
   analysis: {
     rank: number | null;
@@ -56,48 +80,80 @@ interface DashboardData {
   };
 }
 
+interface ImportBatch {
+  id: string;
+  name: string;
+  createdAt: string;
+  status: "processing" | "awaiting_review" | "completed" | "failed" | "partial";
+  fileCount: number;
+  totalRows: number;
+  rowsRequiringReview: number;
+  errorMessage?: string;
+}
+
+function mapBatchStatus(
+  status: string | null | undefined
+): ImportBatch["status"] {
+  switch (status) {
+    case "awaiting_review":
+      return "awaiting_review";
+    case "completed":
+      return "completed";
+    case "failed":
+      return "failed";
+    case "partially_completed":
+      return "partial";
+    default:
+      return "processing";
+  }
+}
+
 export function Dashboard() {
+  const router = useRouter();
+  const searchParams = useSearchParams();
   const { tenantId } = useAppContext();
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [data, setData] = useState<DashboardData | null>(null);
+  const [batches, setBatches] = useState<ImportBatch[]>([]);
   const [loading, setLoading] = useState(true);
+  const [batchesLoading, setBatchesLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
-  const [filters, setFilters] = useState({
-    tenantId,
-    mspProgramId: "",
+  const [selectedRequisition, setSelectedRequisition] = useState<RequisitionWithAnalysis | null>(null);
+  const [page, setPage] = useState(1);
+  const [filters, setFilters] = useState<FilterState>({
+    search: "",
     status: "",
     recommendation: "",
-    minOpportunityScore: "",
-    maxOpportunityScore: "",
+    minScore: "",
+    maxScore: "",
     customer: "",
     isNewToday: false,
-    page: 1,
-    limit: 20,
   });
 
-  useEffect(() => {
-    fetch("/api/setup").catch(() => undefined);
-  }, []);
-
-  const hasRequisitions = (data?.pagination?.total ?? 0) > 0;
-
-  useEffect(() => {
-    fetchRequisitions();
-  }, [filters]);
-
-  const fetchRequisitions = async () => {
+  // Fetch functions defined with useCallback
+  const fetchRequisitions = useCallback(async () => {
     setLoading(true);
+    setError(null);
     try {
       const params = new URLSearchParams();
-      Object.entries(filters).forEach(([key, value]) => {
-        if (value !== undefined && value !== "" && value !== false) {
-          params.append(key, String(value));
-        }
-      });
+      params.append("tenantId", tenantId);
+      params.append("page", String(page));
+      params.append("limit", "20");
+      params.append("sortBy", "rank");
+      params.append("sortOrder", "asc");
 
-      const response = await fetch(`/api/requisitions?${params}`);
-      if (!response.ok) {
-        throw new Error("Failed to fetch requisitions");
-      }
+      if (filters.status) params.append("status", filters.status);
+      if (filters.recommendation) params.append("recommendation", filters.recommendation);
+      if (filters.minScore) params.append("minOpportunityScore", filters.minScore);
+      if (filters.maxScore) params.append("maxOpportunityScore", filters.maxScore);
+      if (filters.customer) params.append("customer", filters.customer);
+      if (filters.search) params.append("customer", filters.search);
+      if (filters.isNewToday) params.append("isNewToday", "true");
+
+      const response = await fetch(`/api/requisitions?${params}`, {
+        cache: "no-store",
+      });
+      if (!response.ok) throw new Error("Failed to fetch requisitions");
 
       const result = await response.json();
       setData(result);
@@ -106,12 +162,81 @@ export function Dashboard() {
     } finally {
       setLoading(false);
     }
-  };
+  }, [tenantId, page, filters]);
 
-  const handleExport = async (format: "xlsx" | "csv") => {
+  const fetchBatches = useCallback(async () => {
+    setBatchesLoading(true);
+    try {
+      const response = await fetch(
+        `/api/batches?tenantId=${encodeURIComponent(tenantId)}`,
+        { cache: "no-store" }
+      );
+      if (!response.ok) {
+        setBatches([]);
+        return;
+      }
+      const result = await response.json();
+      const mapped: ImportBatch[] = (result.batches || []).slice(0, 5).map(
+        (batch: {
+          id: string;
+          status?: string;
+          createdAt?: string;
+          filesCount?: number;
+          sanitizedErrorMessage?: string | null;
+          processingSummary?: {
+            sourceRowCount?: number;
+            uniqueRequisitionCount?: number;
+            originalFilename?: string;
+          } | null;
+        }) => ({
+          id: batch.id,
+          name:
+            batch.processingSummary?.originalFilename ||
+            `Import ${batch.id.slice(0, 8)}`,
+          createdAt: batch.createdAt || new Date().toISOString(),
+          status: mapBatchStatus(batch.status),
+          fileCount: batch.filesCount ?? 0,
+          totalRows:
+            batch.processingSummary?.sourceRowCount ??
+            batch.processingSummary?.uniqueRequisitionCount ??
+            0,
+          rowsRequiringReview: 0,
+          errorMessage: batch.sanitizedErrorMessage || undefined,
+        })
+      );
+      setBatches(mapped);
+    } catch {
+      setBatches([]);
+    } finally {
+      setBatchesLoading(false);
+    }
+  }, [tenantId]);
+
+  // Effects
+  useEffect(() => {
+    fetch("/api/setup").catch(() => undefined);
+  }, []);
+
+  useEffect(() => {
+    fetchRequisitions();
+  }, [fetchRequisitions]);
+
+  useEffect(() => {
+    fetchBatches();
+  }, [fetchBatches]);
+
+  // After import completion, force a fresh fetch
+  useEffect(() => {
+    if (searchParams.get("imported") === "1") {
+      fetchRequisitions();
+      fetchBatches();
+      router.replace("/");
+    }
+  }, [searchParams, fetchRequisitions, fetchBatches, router]);
+
+  const handleExport = async (format: "csv" | "xlsx") => {
     const params = new URLSearchParams();
-    params.append("tenantId", filters.tenantId);
-    if (filters.mspProgramId) params.append("mspProgramId", filters.mspProgramId);
+    params.append("tenantId", tenantId);
     params.append("format", format);
 
     const response = await fetch(`/api/export?${params}`);
@@ -131,82 +256,283 @@ export function Dashboard() {
     document.body.removeChild(a);
   };
 
+  const kpis = useMemo(() => {
+    return {
+      totalRequisitions: data?.pagination?.total ?? 0,
+      newToday: 0,
+      highPriority: 0,
+      negativeProfit: 0,
+      noLongerVisible: 0,
+      avgScore: 0,
+    };
+  }, [data]);
+
+  const quickInsights = useMemo(() => {
+    if (!data?.requisitions?.length) return null;
+
+    const reqs = data.requisitions;
+    
+    const topOpportunity = reqs
+      .filter((r) => r.analysis?.opportunityScore)
+      .sort((a, b) => (b.analysis?.opportunityScore || 0) - (a.analysis?.opportunityScore || 0))[0];
+
+    const totalWeeklyProfit = reqs.reduce((sum, r) => {
+      return sum + parseFloat(r.analysis?.weeklyProfit || "0");
+    }, 0);
+    const negativeProfitCount = reqs.filter((r) => {
+      return parseFloat(r.analysis?.estimatedProfitPerHour || "0") <= 0;
+    }).length;
+    const avgMargin = reqs.length > 0
+      ? reqs.reduce((sum, r) => sum + parseFloat(r.analysis?.netMarginPercent || "0"), 0) / reqs.length
+      : 0;
+
+    const lowCompetition = reqs.filter((r) => (r.requisition.submissionCount || 0) <= 2).length;
+    const highCompetition = reqs.filter((r) => (r.requisition.submissionCount || 0) > 10).length;
+    const avgSubmissions = reqs.length > 0
+      ? reqs.reduce((sum, r) => sum + (r.requisition.submissionCount || 0), 0) / reqs.length
+      : 0;
+
+    return {
+      topOpportunity: topOpportunity?.analysis
+        ? {
+            jobTitle: topOpportunity.requisition.jobTitle || "Unknown",
+            requisitionId: topOpportunity.requisition.requisitionId || "-",
+            opportunityScore: topOpportunity.analysis.opportunityScore || 0,
+            recommendation: topOpportunity.analysis.finalRecommendation || "Unknown",
+            estimatedProfitPerHour: parseFloat(topOpportunity.analysis.estimatedProfitPerHour || "0"),
+          }
+        : null,
+      portfolioStats: {
+        estimatedWeeklyProfit: totalWeeklyProfit,
+        negativeProfitCount,
+        averageNetMargin: avgMargin,
+      },
+      competitionStats: {
+        lowCompetitionCount: lowCompetition,
+        highCompetitionCount: highCompetition,
+        averageSubmissions: avgSubmissions,
+      },
+    };
+  }, [data]);
+
+  const customers = useMemo(() => {
+    if (!data?.requisitions) return [];
+    const customerSet = new Set<string>();
+    data.requisitions.forEach((r) => {
+      const name = r.requisition.normalizedCustomerName || r.requisition.sourceCustomerName;
+      if (name) customerSet.add(name);
+    });
+    return Array.from(customerSet).sort();
+  }, [data]);
+
+  const hasActiveFilters =
+    filters.search ||
+    filters.status ||
+    filters.recommendation ||
+    filters.minScore ||
+    filters.maxScore ||
+    filters.customer ||
+    filters.isNewToday;
+
+  const clearFilters = () => {
+    setFilters({
+      search: "",
+      status: "",
+      recommendation: "",
+      minScore: "",
+      maxScore: "",
+      customer: "",
+      isNewToday: false,
+    });
+  };
+
+  const hasRequisitions = (data?.pagination?.total ?? 0) > 0;
+  const hasProcessingBatches = batches.some((b) => b.status === "processing");
+  const hasAwaitingReviewBatches = batches.some((b) => b.status === "awaiting_review");
+  const hasFailedBatches = batches.some((b) => b.status === "failed");
+
   if (error) {
     return (
-      <div className="p-8 text-center">
-        <div className="text-red-600 mb-4">Error: {error}</div>
-        <button
-          onClick={fetchRequisitions}
-          className="px-4 py-2 bg-blue-600 text-white rounded hover:bg-blue-700"
-        >
-          Retry
-        </button>
+      <div className="min-h-screen bg-slate-50 flex items-center justify-center">
+        <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-8 text-center max-w-md">
+          <div className="w-16 h-16 bg-red-100 rounded-full flex items-center justify-center mx-auto mb-4">
+            <AlertTriangleIcon className="w-8 h-8 text-red-600" />
+          </div>
+          <h2 className="text-xl font-semibold text-slate-900 mb-2">Something went wrong</h2>
+          <p className="text-slate-500 mb-6">{error}</p>
+          <button
+            onClick={fetchRequisitions}
+            className="px-4 py-2 bg-emerald-600 text-white font-medium rounded-lg hover:bg-emerald-700 transition-colors"
+          >
+            Try Again
+          </button>
+        </div>
       </div>
     );
   }
 
   return (
-    <div className="min-h-screen bg-gray-50">
-      {/* Header */}
-      <header className="bg-white shadow-sm border-b">
-        <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-4">
-          <div className="flex justify-between items-center">
-            <div>
-              <h1 className="text-2xl font-bold text-gray-900">
-                Zip Staff MSP Requisition Intelligence
-              </h1>
-              <p className="text-sm text-gray-500 mt-1">
-                Ranked requisitions with financial projections and opportunity scores
-              </p>
+    <div className="min-h-screen bg-slate-50 flex">
+      <DashboardSidebar
+        isCollapsed={sidebarCollapsed}
+        onToggle={() => setSidebarCollapsed(!sidebarCollapsed)}
+      />
+
+      <div className="flex-1 flex flex-col min-w-0 lg:ml-0">
+        <DashboardTopbar
+          pageTitle="Requisition Intelligence"
+          breadcrumbs={[{ label: "Dashboard", href: "/" }, { label: "Overview" }]}
+        />
+
+        <main className="flex-1 overflow-y-auto">
+          <div className="px-4 sm:px-6 lg:px-8 py-6 max-w-7xl mx-auto">
+            {/* Page Header */}
+            <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4 mb-6">
+              <div>
+                <h1 className="text-2xl font-bold text-slate-900">Requisition Intelligence</h1>
+                <p className="mt-1 text-sm text-slate-500">
+                  Prioritize MSP requisitions using competition, profitability, fillability, bill rate, and contract duration.
+                </p>
+              </div>
+              <div className="flex items-center gap-3 flex-wrap justify-end">
+                <ClearDataButton
+                  tenantId={tenantId}
+                  onCleared={() => {
+                    fetchRequisitions();
+                    fetchBatches();
+                  }}
+                />
+                <Link
+                  href="/requisitions/import"
+                  className="inline-flex items-center gap-2 px-4 py-2 bg-emerald-600 text-white font-medium rounded-lg hover:bg-emerald-700 transition-colors shadow-sm"
+                >
+                  <UploadIcon className="w-4 h-4" />
+                  Import Requisitions
+                </Link>
+                <ExportMenu
+                  onExport={handleExport}
+                  disabled={!hasRequisitions}
+                  disabledTooltip="Import and analyze requisitions before exporting."
+                />
+              </div>
             </div>
-            <div className="flex gap-3">
-              <Link
-                href="/requisitions/import"
-                className="px-4 py-2 text-sm font-medium text-white bg-emerald-600 rounded-md hover:bg-emerald-700"
-              >
-                Import Requisitions
-              </Link>
-              <button
-                onClick={() => handleExport("csv")}
-                disabled={!hasRequisitions}
-                className="px-4 py-2 text-sm font-medium text-gray-700 bg-white border border-gray-300 rounded-md hover:bg-gray-50 disabled:opacity-50 disabled:cursor-not-allowed"
-              >
-                Export CSV
-              </button>
-              <button
-                onClick={() => handleExport("xlsx")}
-                disabled={!hasRequisitions}
-                className="px-4 py-2 text-sm font-medium text-white bg-blue-600 rounded-md hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed"
-              >
-                Export Excel
-              </button>
+
+            {/* KPI Cards */}
+            <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-4 mb-6">
+              <StatCard
+                title="Total Requisitions"
+                value={kpis.totalRequisitions.toLocaleString()}
+                icon={<BriefcaseIcon className="w-5 h-5" />}
+                isLoading={loading}
+              />
+              <StatCard
+                title="New Today"
+                value={kpis.newToday.toLocaleString()}
+                icon={<SparklesIcon className="w-5 h-5" />}
+                accent="success"
+                isLoading={loading}
+              />
+              <StatCard
+                title="High Priority"
+                value={kpis.highPriority.toLocaleString()}
+                icon={<TargetIcon className="w-5 h-5" />}
+                accent="success"
+                isLoading={loading}
+              />
+              <StatCard
+                title="Negative Profit"
+                value={kpis.negativeProfit.toLocaleString()}
+                icon={<AlertTriangleIcon className="w-5 h-5" />}
+                accent={kpis.negativeProfit > 0 ? "danger" : "default"}
+                isLoading={loading}
+              />
+              <StatCard
+                title="No Longer Visible"
+                value={kpis.noLongerVisible.toLocaleString()}
+                icon={<EyeOffIcon className="w-5 h-5" />}
+                accent={kpis.noLongerVisible > 0 ? "warning" : "default"}
+                isLoading={loading}
+              />
+              <StatCard
+                title="Avg Score"
+                value={kpis.avgScore.toString()}
+                icon={<GaugeIcon className="w-5 h-5" />}
+                description="Opportunity score"
+                isLoading={loading}
+              />
+            </div>
+
+            {/* Quick Insights */}
+            {hasRequisitions && quickInsights && (
+              <div className="mb-6">
+                <QuickInsights
+                  topOpportunity={quickInsights.topOpportunity}
+                  portfolioStats={quickInsights.portfolioStats}
+                  competitionStats={quickInsights.competitionStats}
+                  isLoading={loading}
+                />
+              </div>
+            )}
+
+            {/* Filters */}
+            <div className="mb-6">
+              <FilterToolbar
+                filters={filters}
+                onChange={setFilters}
+                customers={customers}
+              />
+            </div>
+
+            {/* Content Area */}
+            <div className="space-y-6">
+              {!hasRequisitions && !loading && (
+                <>
+                  {hasProcessingBatches && <ProcessingEmptyState />}
+                  {hasAwaitingReviewBatches && (
+                    <AwaitingReviewEmptyState 
+                      batchId={batches.find(b => b.status === "awaiting_review")?.id || ""} 
+                    />
+                  )}
+                  {hasFailedBatches && (
+                    <FailedImportEmptyState 
+                      batchId={batches.find(b => b.status === "failed")?.id} 
+                    />
+                  )}
+                  {!hasProcessingBatches && !hasAwaitingReviewBatches && !hasFailedBatches && (
+                    <EmptyState />
+                  )}
+                </>
+              )}
+              
+              {hasActiveFilters && data?.requisitions.length === 0 && (
+                <FilteredEmptyState onClearFilters={clearFilters} />
+              )}
+              
+              {(hasRequisitions || loading) && (
+                <RequisitionTable
+                  data={data}
+                  onPageChange={setPage}
+                  onRowClick={(id) => {
+                    const req = data?.requisitions.find((r) => r.requisition.id === id);
+                    if (req) setSelectedRequisition(req);
+                  }}
+                  isLoading={loading}
+                />
+              )}
+
+              {!loading && batches.length > 0 && (
+                <ImportActivityList batches={batches} isLoading={batchesLoading} />
+              )}
             </div>
           </div>
-        </div>
-      </header>
+        </main>
+      </div>
 
-      <main className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-6">
-        {/* KPI Cards */}
-        <KPICards requisitions={data?.requisitions || []} />
-
-        {/* Filters */}
-        <Filters filters={filters} onChange={setFilters} />
-
-        {/* Requisition Table */}
-        <div className="mt-6">
-          {loading ? (
-            <div className="text-center py-12">
-              <div className="inline-block animate-spin rounded-full h-8 w-8 border-b-2 border-blue-600"></div>
-              <p className="mt-2 text-gray-600">Loading requisitions...</p>
-            </div>
-          ) : (
-            <RequisitionTable
-              data={data}
-              onPageChange={(page) => setFilters((f) => ({ ...f, page }))}
-            />
-          )}
-        </div>
-      </main>
+      <DetailDrawer
+        requisition={selectedRequisition}
+        isOpen={!!selectedRequisition}
+        onClose={() => setSelectedRequisition(null)}
+      />
     </div>
   );
 }

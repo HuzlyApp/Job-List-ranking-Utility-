@@ -256,7 +256,7 @@ All financial calculations are performed in application code, not by AI. This en
 
 ## Future Enhancements
 
-- Additional AI provider support (Grok)
+- Additional AI provider support (future providers as needed)
 - Real-time collaboration
 - Advanced filtering and saved views
 - Integration with ATS systems

@@ -1,41 +1,36 @@
 import { NextRequest, NextResponse } from "next/server";
-import { db } from "@/db";
-import { requisitions, requisitionAnalysisResults } from "@/db/schema";
-import { eq, and, desc } from "drizzle-orm";
 import ExcelJS from "exceljs";
+import { listRequisitionsWithAnalysis } from "@/lib/dashboard-queries";
 
-// GET /api/export/excel - Export requisitions to Excel
+export const dynamic = "force-dynamic";
+
+// GET /api/export - Export requisitions to Excel or CSV
 export async function GET(request: NextRequest) {
   try {
     const { searchParams } = new URL(request.url);
     const tenantId = searchParams.get("tenantId");
-    const mspProgramId = searchParams.get("mspProgramId");
+    const mspProgramId = searchParams.get("mspProgramId") || undefined;
     const format = searchParams.get("format") || "xlsx";
 
     if (!tenantId) {
       return NextResponse.json({ error: "tenantId is required" }, { status: 400 });
     }
 
-    // Build query
-    let whereConditions = [eq(requisitions.tenantId, tenantId)];
+    const { requisitions: exportRows, pagination } = await listRequisitionsWithAnalysis({
+      tenantId,
+      mspProgramId,
+      page: 1,
+      limit: 500,
+      sortBy: "opportunityScore",
+      sortOrder: "desc",
+    });
 
-    if (mspProgramId) {
-      whereConditions.push(eq(requisitions.mspProgramId, mspProgramId));
-    }
-
-    // Get all requisitions with analysis
-    const results = await db
-      .select({
-        requisition: requisitions,
-        analysis: requisitionAnalysisResults,
-      })
-      .from(requisitions)
-      .leftJoin(
-        requisitionAnalysisResults,
-        eq(requisitions.id, requisitionAnalysisResults.requisitionId)
-      )
-      .where(and(...whereConditions))
-      .orderBy(desc(requisitionAnalysisResults.opportunityScore));
+    console.info("[export.fetch]", {
+      tenant_id: tenantId,
+      requisition_count: exportRows.length,
+      total: pagination.total,
+      format,
+    });
 
     if (format === "csv") {
       // Generate CSV
@@ -80,7 +75,7 @@ export async function GET(request: NextRequest) {
         "Requires Manual Review",
       ];
 
-      const csvRows = results.map((r) => {
+      const csvRows = exportRows.map((r) => {
         const req = r.requisition;
         const analysis = r.analysis;
         const dataQualityNotes = Array.isArray(req.dataQualityNotes)
@@ -195,7 +190,7 @@ export async function GET(request: NextRequest) {
     rankedSheet.views = [{ state: "frozen", ySplit: 1 }];
 
     // Add data
-    for (const r of results) {
+    for (const r of exportRows) {
       const req = r.requisition;
       const analysis = r.analysis;
 
@@ -258,14 +253,15 @@ export async function GET(request: NextRequest) {
     const summarySheet = workbook.addWorksheet("Summary");
     summarySheet.columns = [{ header: "Metric", key: "metric", width: 40 }, { header: "Value", key: "value", width: 20 }];
 
-    const totalRequisitions = results.length;
-    const newToday = results.filter((r) => r.requisition.isNewToday).length;
-    const highPriority = results.filter(
+    const totalRequisitions = exportRows.length;
+    const newToday = exportRows.filter((r) => r.requisition.isNewToday).length;
+    const highPriority = exportRows.filter(
       (r) => r.analysis?.finalRecommendation === "Recruit Immediately" || r.analysis?.finalRecommendation === "High Priority"
     ).length;
-    const negativeProfit = results.filter(
-      (r) => parseFloat(r.analysis?.estimatedProfitPerHour || "0") <= 0
-    ).length;
+    const negativeProfit = exportRows.filter((r) => {
+      const profit = r.analysis?.estimatedProfitPerHour;
+      return profit != null && parseFloat(profit) < 0;
+    }).length;
 
     summarySheet.addRow({ metric: "Total Requisitions", value: totalRequisitions });
     summarySheet.addRow({ metric: "New Today", value: newToday });

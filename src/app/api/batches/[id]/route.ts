@@ -97,14 +97,24 @@ export async function POST(
         );
       }
       await runPayAnalysis(batchId, validated.tenantId);
-      await finalizeBatch(
+      const summary = await finalizeBatch(
         batchId,
         validated.tenantId,
         validated.mspProgramId,
         validated.assumptions,
         validated.weights
       );
-      return NextResponse.json({ success: true });
+      if (summary.uniqueRequisitionCount === 0) {
+        return NextResponse.json(
+          {
+            success: false,
+            error: "No requisitions were finalized",
+            summary,
+          },
+          { status: 422 }
+        );
+      }
+      return NextResponse.json({ success: true, summary });
     }
 
     return NextResponse.json({ error: "Invalid action" }, { status: 400 });
@@ -113,10 +123,17 @@ export async function POST(
     if (error instanceof z.ZodError) {
       return NextResponse.json({ error: error.issues }, { status: 400 });
     }
-    return NextResponse.json(
-      { error: error instanceof Error ? error.message : "Failed to process batch" },
-      { status: 500 }
-    );
+    const message =
+      error instanceof Error ? error.message : "Failed to process batch";
+    const statusCode =
+      error instanceof Error &&
+      "statusCode" in error &&
+      typeof (error as { statusCode?: unknown }).statusCode === "number"
+        ? (error as { statusCode: number }).statusCode
+        : message === "Batch not found" || message === "Row not found"
+          ? 404
+          : 500;
+    return NextResponse.json({ error: message }, { status: statusCode });
   }
 }
 

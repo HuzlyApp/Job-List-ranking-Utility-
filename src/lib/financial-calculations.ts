@@ -287,7 +287,15 @@ export function calculateScores(
 /**
  * Get recommendation label based on opportunity score
  */
-export function getRecommendationLabel(opportunityScore: number): string {
+export function getRecommendationLabel(
+  opportunityScore: number
+):
+  | "Recruit Immediately"
+  | "High Priority"
+  | "Good Opportunity"
+  | "Candidate Driven"
+  | "Only If Candidate Available"
+  | "Skip or Monitor" {
   if (opportunityScore >= 90) return "Recruit Immediately";
   if (opportunityScore >= 80) return "High Priority";
   if (opportunityScore >= 70) return "Good Opportunity";

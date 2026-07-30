@@ -128,6 +128,42 @@ export async function processBatchExtraction(
   tenantId: string,
   aiProvider: string = "claude"
 ): Promise<ExtractionResult> {
+  const [existingBatch] = await db
+    .select({ status: requisitionAnalysisBatches.status })
+    .from(requisitionAnalysisBatches)
+    .where(
+      and(
+        eq(requisitionAnalysisBatches.id, batchId),
+        eq(requisitionAnalysisBatches.tenantId, tenantId)
+      )
+    );
+
+  // Idempotent: if parse already finished, do not re-insert source rows
+  if (
+    existingBatch &&
+    (existingBatch.status === "awaiting_review" ||
+      existingBatch.status === "reviewing" ||
+      existingBatch.status === "analyzing" ||
+      existingBatch.status === "calculating" ||
+      existingBatch.status === "completed")
+  ) {
+    const existingRows = await db
+      .select()
+      .from(requisitionSourceRows)
+      .where(
+        and(
+          eq(requisitionSourceRows.batchId, batchId),
+          eq(requisitionSourceRows.tenantId, tenantId)
+        )
+      );
+    return {
+      batchId,
+      extractedRows: existingRows.map((r) => r.extractedJson as ExtractedRequisition),
+      duplicatesDetected: 0,
+      uncertainCount: 0,
+    };
+  }
+
   await db
     .update(requisitionAnalysisBatches)
     .set({ status: "parsing" })
@@ -248,7 +284,10 @@ export async function processBatchExtraction(
         });
         await db
           .update(requisitionSourceFiles)
-          .set({ processingStatus: "parsed" })
+          .set({
+            processingStatus: "parsed",
+            detectedEncoding: parsed.encoding || null,
+          })
           .where(eq(requisitionSourceFiles.id, file.id));
       }
     } catch (err) {
@@ -752,12 +791,43 @@ export async function finalizeBatch(
   mspProgramId: string,
   assumptions: FinancialAssumptions,
   weights: ScoringWeights
-): Promise<void> {
+): Promise<{
+  sourceRowCount: number;
+  uniqueRequisitionCount: number;
+  analysesCompleted: number;
+  analysesPending: number;
+  requiresReview: number;
+}> {
+  console.info("[finalize.start]", { batch_id: batchId, tenant_id: tenantId });
+
   // Update status
   await db
     .update(requisitionAnalysisBatches)
     .set({ status: "calculating" })
     .where(eq(requisitionAnalysisBatches.id, batchId));
+
+  const [sourceRowCountRow] = await db
+    .select({ count: sql<number>`count(*)::int` })
+    .from(requisitionSourceRows)
+    .where(
+      and(
+        eq(requisitionSourceRows.batchId, batchId),
+        eq(requisitionSourceRows.tenantId, tenantId)
+      )
+    );
+  const sourceRowCount = Number(sourceRowCountRow?.count) || 0;
+
+  const [excludedCountRow] = await db
+    .select({ count: sql<number>`count(*)::int` })
+    .from(requisitionSourceRows)
+    .where(
+      and(
+        eq(requisitionSourceRows.batchId, batchId),
+        eq(requisitionSourceRows.tenantId, tenantId),
+        eq(requisitionSourceRows.excluded, true)
+      )
+    );
+  const excludedCount = Number(excludedCountRow?.count) || 0;
 
   // Get deduplicated rows
   const rows = await deduplicateRequisitions(batchId, tenantId);
@@ -786,6 +856,7 @@ export async function finalizeBatch(
     durationWeeks: number | null;
     effectiveVendorRate: number;
     releasedDate: Date | null;
+    requiresManualReview: boolean;
   }> = [];
 
   for (const row of rows) {
@@ -992,8 +1063,8 @@ export async function finalizeBatch(
           durationScore: scores.durationScore,
           opportunityScore: scores.opportunityScore,
           rank: 0, // Will be updated after all calculations
-          calculatedRecommendation: recommendation as any,
-          finalRecommendation: recommendation as any,
+          calculatedRecommendation: recommendation,
+          finalRecommendation: recommendation,
           requiresManualReview: requiresHealthcareReview,
         })
         .onConflictDoUpdate({
@@ -1020,8 +1091,8 @@ export async function finalizeBatch(
             billRateScore: scores.billRateScore,
             durationScore: scores.durationScore,
             opportunityScore: scores.opportunityScore,
-            calculatedRecommendation: recommendation as any,
-            finalRecommendation: recommendation as any,
+            calculatedRecommendation: recommendation,
+            finalRecommendation: recommendation,
             requiresManualReview: requiresHealthcareReview,
             updatedAt: new Date(),
           },
@@ -1036,13 +1107,14 @@ export async function finalizeBatch(
         durationWeeks,
         effectiveVendorRate: financials.effectiveVendorRate.toNumber(),
         releasedDate: row.released_date ? new Date(row.released_date) : null,
+        requiresManualReview: requiresHealthcareReview,
       });
     }
   }
 
   // Assign ranks
   const ranked = assignRanks(results);
-  
+
   for (const item of ranked) {
     await db
       .update(requisitionAnalysisResults)
@@ -1050,18 +1122,67 @@ export async function finalizeBatch(
       .where(eq(requisitionAnalysisResults.requisitionId, item.id));
   }
 
-  // Update batch status
+  const uniqueRequisitionCount = results.length;
+  const requiresManualReviewCount = results.filter((r) => r.requiresManualReview).length;
+
+  if (uniqueRequisitionCount === 0 && excludedCount < sourceRowCount) {
+    await db
+      .update(requisitionAnalysisBatches)
+      .set({
+        status: "failed",
+        errorCode: "ZERO_FINALIZED",
+        sanitizedErrorMessage:
+          "Finalization produced zero requisitions while source rows were not all excluded.",
+        completedAt: new Date(),
+      })
+      .where(eq(requisitionAnalysisBatches.id, batchId));
+    throw new Error(
+      "A batch cannot complete with zero finalized requisitions unless all reviewed rows were excluded."
+    );
+  }
+
+  const [existingBatch] = await db
+    .select({ processingSummary: requisitionAnalysisBatches.processingSummary })
+    .from(requisitionAnalysisBatches)
+    .where(eq(requisitionAnalysisBatches.id, batchId));
+
+  const summary = {
+    ...((existingBatch?.processingSummary as Record<string, unknown>) || {}),
+    sourceRowCount,
+    uniqueRequisitionCount,
+    analysesCompleted: uniqueRequisitionCount,
+    analysesPending: 0,
+    requiresReview: requiresManualReviewCount,
+    excludedCount,
+  };
+
   await db
     .update(requisitionAnalysisBatches)
     .set({
       status: "completed",
       completedAt: new Date(),
+      processingSummary: summary,
     })
     .where(eq(requisitionAnalysisBatches.id, batchId));
+
+  console.info("[finalize.complete]", {
+    batch_id: batchId,
+    tenant_id: tenantId,
+    requisition_count: uniqueRequisitionCount,
+    source_row_count: sourceRowCount,
+  });
+
+  return {
+    sourceRowCount,
+    uniqueRequisitionCount,
+    analysesCompleted: uniqueRequisitionCount,
+    analysesPending: 0,
+    requiresReview: requiresManualReviewCount,
+  };
 }
 
 /**
- * Get batch status
+ * Get batch status (lightweight — for polling; does not return full extracted JSON)
  */
 export async function getBatchStatus(batchId: string, tenantId: string) {
   const [batch] = await db
@@ -1075,22 +1196,49 @@ export async function getBatchStatus(batchId: string, tenantId: string) {
     );
 
   if (!batch) {
-    throw new Error("Batch not found");
+    const err = new Error("Batch not found");
+    (err as Error & { statusCode: number }).statusCode = 404;
+    throw err;
   }
 
   const sourceFiles = await db
-    .select()
+    .select({
+      id: requisitionSourceFiles.id,
+      originalFilename: requisitionSourceFiles.originalFilename,
+      processingStatus: requisitionSourceFiles.processingStatus,
+      errorMessage: requisitionSourceFiles.errorMessage,
+      mimeType: requisitionSourceFiles.mimeType,
+    })
     .from(requisitionSourceFiles)
     .where(eq(requisitionSourceFiles.batchId, batchId));
 
-  const sourceRows = await db
-    .select()
+  const [rowCount] = await db
+    .select({ count: sql<number>`count(*)::int` })
     .from(requisitionSourceRows)
-    .where(eq(requisitionSourceRows.batchId, batchId));
+    .where(
+      and(
+        eq(requisitionSourceRows.batchId, batchId),
+        eq(requisitionSourceRows.tenantId, tenantId)
+      )
+    );
 
   return {
-    batch,
+    batch: {
+      id: batch.id,
+      status: batch.status,
+      mspProgramId: batch.mspProgramId,
+      processingSummary: batch.processingSummary,
+      sanitizedErrorMessage: batch.sanitizedErrorMessage,
+      errorCode: batch.errorCode,
+      filesCount: batch.filesCount,
+      startedAt: batch.startedAt,
+      completedAt: batch.completedAt,
+    },
     sourceFiles,
-    sourceRows,
+    /** Lightweight placeholders so older clients that expect an array keep working */
+    sourceRows: Array.from({ length: rowCount?.count ?? 0 }, (_, i) => ({
+      id: `row-${i}`,
+    })),
+    sourceRowCount: rowCount?.count ?? 0,
   };
 }

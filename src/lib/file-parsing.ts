@@ -683,23 +683,27 @@ function parseRawMatrix(
   if (headerRow >= 0) {
     headerMode = "detected";
     headers = normalizedData[headerRow].map((h) => String(h ?? "").trim());
+    const detected: Record<number, string> = {};
     headers.forEach((header, index) => {
       const field = normalizeColumnHeader(header);
       if (field) {
-        fieldMapping[index] = field;
+        detected[index] = field;
       }
     });
+    fieldMapping = detected;
     dataStart = headerRow + 1;
     mappingConfidence = Object.keys(fieldMapping).length >= 5 ? "high" : "low";
   } else {
     // Positional Randstad layout — first row is data.
     headerMode = "positional_randstad";
+    const positional: Record<number, string> = {};
     RANDSTAD_COLUMN_LAYOUT.forEach((field, index) => {
       if (field) {
-        fieldMapping[index] = field;
+        positional[index] = field;
         headers[index] = SOURCE_COLUMN_LABELS[field] || field;
       }
     });
+    fieldMapping = positional;
     dataStart = 0;
     mappingConfidence = "high";
   }

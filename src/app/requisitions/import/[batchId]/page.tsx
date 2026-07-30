@@ -1,9 +1,23 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { Suspense, useCallback, useEffect, useMemo, useState } from "react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { useAppContext } from "@/lib/app-context";
+import { ImportLayout } from "@/components/import/ImportLayout";
+import { ImportHeader } from "@/components/import/ImportHeader";
+import { ImportStepper, ImportStep } from "@/components/import/ImportStepper";
+import { ImportProgressCard, ProcessingStage } from "@/components/import/ImportProgressCard";
+import { BatchSummaryPanel } from "@/components/import/BatchSummaryPanel";
+import { ColumnMappingTable } from "@/components/import/ColumnMappingTable";
+import { DataPreviewTable } from "@/components/import/DataPreviewTable";
+import { ReviewTable } from "@/components/import/ReviewTable";
+import { ReviewSummaryBar } from "@/components/import/ReviewSummaryBar";
+import { ClaudeAnalysisProgress } from "@/components/import/ClaudeAnalysisProgress";
+import { ImportErrorCard } from "@/components/import/ImportErrorCard";
+import { ImportCompletionSummary } from "@/components/import/ImportCompletionSummary";
+import { SafeLeaveNotice } from "@/components/import/SafeLeaveNotice";
+import { AlertTriangleIcon } from "@/components/ui/icons";
 
 interface ImportSummary {
   fileName: string;
@@ -44,6 +58,8 @@ interface BatchStatus {
       import_summaries?: ImportSummary[];
     };
     mspProgramId: string;
+    createdAt?: string;
+    representsCompletePortalView?: boolean;
   };
   sourceFiles: Array<{
     id: string;
@@ -82,35 +98,7 @@ interface ReviewRow {
   dataQualityNotes: string[];
 }
 
-const STAGES = [
-  "Reading your Randstad export",
-  "Detecting requisition columns",
-  "Cleaning rates and dates",
-  "Checking for duplicate requisitions",
-  "Preparing your review",
-];
-
-function stageIndex(status: string): number {
-  switch (status) {
-    case "uploaded":
-    case "validating":
-      return 0;
-    case "parsing":
-      return 1;
-    case "extracting":
-      return 2;
-    case "awaiting_review":
-    case "reviewing":
-      return 4;
-    case "analyzing":
-    case "calculating":
-      return 3;
-    case "completed":
-      return 4;
-    default:
-      return 0;
-  }
-}
+type PageMode = "processing" | "preview" | "review" | "analyzing" | "complete" | "failed";
 
 function formatBillRate(row: ReviewRow["data"]): string {
   if (row.source_c2c_bill_rate) return row.source_c2c_bill_rate;
@@ -121,7 +109,6 @@ function formatBillRate(row: ReviewRow["data"]): string {
 
 function formatDate(value: string | null): string {
   if (!value) return "—";
-  // Prefer display as M/D/YYYY from ISO
   const m = value.match(/^(\d{4})-(\d{2})-(\d{2})/);
   if (m) {
     return `${parseInt(m[2], 10)}/${parseInt(m[3], 10)}/${m[1]}`;
@@ -129,44 +116,69 @@ function formatDate(value: string | null): string {
   return value;
 }
 
-export default function BatchImportPage({ params }: { params: Promise<{ batchId: string }> }) {
+function BatchImportPageContent({ params }: { params: Promise<{ batchId: string }> }) {
   const router = useRouter();
   const { tenantId, assumptions, weights } = useAppContext();
   const [batchId, setBatchId] = useState<string>("");
   const [status, setStatus] = useState<BatchStatus | null>(null);
   const [reviewRows, setReviewRows] = useState<ReviewRow[]>([]);
-  const [mode, setMode] = useState<"processing" | "preview" | "review" | "analyzing" | "complete">(
-    "processing"
-  );
+  const [mode, setMode] = useState<PageMode>("processing");
   const [error, setError] = useState<string | null>(null);
   const [analyzing, setAnalyzing] = useState(false);
+  const [selectedRowId, setSelectedRowId] = useState<string | null>(null);
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
+  const [completionSummary, setCompletionSummary] = useState<{
+    sourceRowCount: number;
+    uniqueRequisitionCount: number;
+    analysesCompleted: number;
+    analysesPending: number;
+    requiresReview: number;
+  } | null>(null);
 
   useEffect(() => {
     params.then((p) => setBatchId(p.batchId));
   }, [params]);
 
-  const fetchStatus = useCallback(async () => {
-    if (!batchId) return;
-    const res = await fetch(`/api/batches/${batchId}`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ action: "get_status", tenantId }),
-    });
-    if (!res.ok) return;
-    const data = await res.json();
-    setStatus(data.status);
-
-    const batchStatus = data.status?.batch?.status;
+  const applyBatchStatus = useCallback((batchStatus: string | undefined) => {
+    if (!batchStatus) return;
     if (batchStatus === "awaiting_review" || batchStatus === "reviewing") {
       setMode((prev) => (prev === "review" ? "review" : "preview"));
     } else if (batchStatus === "analyzing" || batchStatus === "calculating") {
       setMode("analyzing");
-    } else if (batchStatus === "completed") {
+    } else if (batchStatus === "completed" || batchStatus === "partially_completed") {
       setMode("complete");
+    } else if (batchStatus === "failed" || batchStatus === "cancelled") {
+      setMode("failed");
+      setError("Import failed. Please try uploading the file again.");
     } else {
       setMode("processing");
     }
-  }, [batchId, tenantId]);
+  }, []);
+
+  const fetchStatus = useCallback(async () => {
+    if (!batchId) return;
+    try {
+      const res = await fetch(`/api/batches/${batchId}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ action: "get_status", tenantId }),
+      });
+      if (!res.ok) {
+        setError("Could not refresh import status. Retrying…");
+        return;
+      }
+      const data = await res.json();
+      const payload = data.status;
+      setStatus(payload);
+      const batchStatus =
+        payload?.batch?.status ||
+        payload?.status ||
+        (typeof payload === "string" ? payload : undefined);
+      applyBatchStatus(batchStatus);
+    } catch {
+      setError("Could not refresh import status. Retrying…");
+    }
+  }, [batchId, tenantId, applyBatchStatus]);
 
   const fetchReview = useCallback(async () => {
     if (!batchId) return;
@@ -184,19 +196,16 @@ export default function BatchImportPage({ params }: { params: Promise<{ batchId:
   useEffect(() => {
     if (!batchId) return;
     fetchStatus();
-    const interval = setInterval(fetchStatus, 3000);
+    if (mode === "preview" || mode === "review" || mode === "complete") {
+      return;
+    }
+    const interval = setInterval(fetchStatus, 2000);
     return () => clearInterval(interval);
-  }, [batchId, fetchStatus]);
+  }, [batchId, fetchStatus, mode]);
 
   useEffect(() => {
     if (mode === "preview" || mode === "review") fetchReview();
   }, [mode, fetchReview]);
-
-  useEffect(() => {
-    if (mode === "complete") {
-      router.push("/?imported=1");
-    }
-  }, [mode, router]);
 
   const updateRow = async (rowId: string, updates: Record<string, unknown>) => {
     await fetch(`/api/batches/${batchId}`, {
@@ -233,6 +242,11 @@ export default function BatchImportPage({ params }: { params: Promise<{ batchId:
         const err = await res.json();
         throw new Error(typeof err.error === "string" ? err.error : "Analysis failed");
       }
+      const payload = await res.json();
+      if (!payload.summary?.uniqueRequisitionCount) {
+        throw new Error("Import finished without saving requisitions");
+      }
+      setCompletionSummary(payload.summary);
       setMode("complete");
     } catch (err) {
       setError(err instanceof Error ? err.message : "Analysis failed");
@@ -244,12 +258,11 @@ export default function BatchImportPage({ params }: { params: Promise<{ batchId:
   const summary = status?.batch?.processingSummary;
   const importSummary = summary?.import_summaries?.[0];
   const batchStatus = status?.batch?.status || "uploaded";
-  const currentStage = stageIndex(batchStatus);
   const needsReview = reviewRows.filter(
     (r) => !r.excluded && (!r.data.requisition_id || !r.data.c2c_bill_rate)
   );
   const readyRows = reviewRows.filter((r) => !r.excluded && r.data.requisition_id);
-  const previewRows = useMemo(() => reviewRows.slice(0, 10), [reviewRows]);
+  const excludedCount = reviewRows.filter((r) => r.excluded).length;
 
   const detectedCount =
     importSummary?.rowsDetected ?? summary?.visible_rows_detected ?? reviewRows.length;
@@ -257,412 +270,300 @@ export default function BatchImportPage({ params }: { params: Promise<{ batchId:
     importSummary?.headerMode === "positional_randstad" ||
     (status?.sourceFiles?.[0]?.originalFilename || "").toLowerCase().includes("randstad");
 
+  // Map batch status to step
+  const currentStep: ImportStep = useMemo(() => {
+    if (mode === "processing") {
+      if (batchStatus === "uploaded" || batchStatus === "validating") return "upload";
+      if (batchStatus === "parsing") return "detect";
+      return "detect";
+    }
+    if (mode === "preview") return "preview";
+    if (mode === "review") return "review";
+    if (mode === "analyzing") return "analyze";
+    if (mode === "complete") return "complete";
+    if (mode === "failed") return "review";
+    return "upload";
+  }, [mode, batchStatus]);
+
+  // Build processing stages
+  const processingStages: ProcessingStage[] = useMemo(() => {
+    const stageIndex: Record<string, number> = {
+      uploaded: 0,
+      validating: 0,
+      parsing: 1,
+      extracting: 2,
+      analyzing: 3,
+      calculating: 3,
+      awaiting_review: 4,
+      reviewing: 4,
+      completed: 4,
+    };
+    const currentIdx = stageIndex[batchStatus] ?? 0;
+
+    const stages = [
+      { id: "upload", label: "File uploaded", detail: status?.sourceFiles?.[0]?.originalFilename },
+      { id: "detect", label: "Detecting file format", detail: importSummary?.encoding ? `Encoding: ${importSummary.encoding}` : undefined },
+      { id: "map", label: "Mapping requisition columns", detail: detectedCount ? `${detectedCount} requisition rows found` : undefined },
+      { id: "normalize", label: "Normalizing rates and dates" },
+      { id: "dedupe", label: "Checking duplicates", detail: summary?.potential_duplicates_detected !== undefined ? `${summary.potential_duplicates_detected} duplicate IDs detected` : undefined },
+      { id: "prepare", label: "Preparing review" },
+    ];
+
+    return stages.map((stage, i) => ({
+      ...stage,
+      status: (i < currentIdx ? "complete" : i === currentIdx ? "active" : "pending") as ProcessingStage["status"],
+    }));
+  }, [batchStatus, status, importSummary, detectedCount, summary]);
+
+  // Build analysis stages
+  const analysisStages = [
+    { id: "prepare", label: "Preparing confirmed data", status: "complete" as const },
+    { id: "send1", label: "Sending batch 1 to Claude", status: "active" as const },
+    { id: "validate1", label: "Validating batch 1 response", status: "pending" as const },
+    { id: "calc", label: "Calculating profitability", status: "pending" as const },
+    { id: "rank", label: "Ranking opportunities", status: "pending" as const },
+    { id: "save", label: "Saving results", status: "pending" as const },
+  ];
+
+  // Preview rows
+  const previewRows = useMemo(
+    () =>
+      reviewRows.slice(0, 10).map((r) => ({
+        id: r.id,
+        status: r.data.status,
+        requisitionId: r.data.requisition_id,
+        customer: r.data.customer,
+        jobTitle: r.data.job_title,
+        submissions: r.data.submissions,
+        billRate: formatBillRate(r.data),
+        location: r.data.location,
+        duration: r.data.duration,
+        releasedDate: r.data.released_date ? formatDate(r.data.released_date) : null,
+      })),
+    [reviewRows]
+  );
+
+  // Column mappings with confidence
+  const columnMappings = useMemo(() => {
+    if (!importSummary?.columnMapping) return [];
+    return importSummary.columnMapping.map((m) => ({
+      ...m,
+      confidence: (importSummary.mappingConfidence === "high" ? "high" : "medium") as "high" | "medium" | "low",
+      sampleValue: undefined as string | undefined,
+    }));
+  }, [importSummary]);
+
   if (!batchId) return null;
 
   return (
-    <div className="min-h-screen bg-gray-50">
-      <header className="bg-white border-b shadow-sm">
-        <div className="max-w-6xl mx-auto px-4 py-4">
-          <Link href="/requisitions/import" className="text-sm text-blue-600 hover:underline">
-            ← New Import
-          </Link>
-          <h1 className="text-2xl font-bold text-gray-900 mt-1">Import Progress</h1>
-          <ol className="flex flex-wrap gap-2 text-xs mt-3">
-            {[
-              "Upload File",
-              "Detect File Format",
-              "Preview Columns",
-              "Review Requisitions",
-              "Analyze With Claude",
-              "View Ranked Results",
-            ].map((step, i) => {
-              const active =
-                (mode === "processing" && i <= 1) ||
-                (mode === "preview" && i === 2) ||
-                (mode === "review" && i === 3) ||
-                (mode === "analyzing" && i === 4) ||
-                (mode === "complete" && i === 5);
-              return (
-                <li
-                  key={step}
-                  className={`px-2 py-1 rounded-full ${active ? "bg-blue-600 text-white" : "bg-gray-200 text-gray-600"}`}
-                >
-                  {step}
-                </li>
-              );
-            })}
-          </ol>
-        </div>
-      </header>
+    <ImportLayout
+      sidebarCollapsed={sidebarCollapsed}
+      onToggleSidebar={() => setSidebarCollapsed(!sidebarCollapsed)}
+      pageTitle="Import Requisitions"
+      breadcrumbs={[
+        { label: "Requisitions", href: "/requisitions" },
+        { label: "Import", href: "/requisitions/import" },
+        { label: batchId.slice(0, 8) },
+      ]}
+    >
+      <ImportHeader
+        batchId={batchId}
+        showNewImport={mode === "complete" || mode === "failed"}
+      />
 
-      <main className="max-w-6xl mx-auto px-4 py-8 space-y-6">
-        {(mode === "processing" || mode === "analyzing") && (
-          <section className="bg-white rounded-lg border p-6 space-y-4">
-            <h2 className="font-semibold text-lg">
-              {mode === "analyzing" ? "Analyzing requisitions…" : "Processing import"}
-            </h2>
-            <ul className="space-y-2">
-              {STAGES.map((stage, i) => (
-                <li
-                  key={stage}
-                  className={`flex items-center gap-2 text-sm ${i <= currentStage ? "text-gray-900" : "text-gray-400"}`}
-                >
-                  <span
-                    className={`w-2 h-2 rounded-full ${i < currentStage ? "bg-green-500" : i === currentStage ? "bg-blue-500 animate-pulse" : "bg-gray-300"}`}
-                  />
-                  {stage}
-                </li>
-              ))}
-            </ul>
-            {summary && (
-              <div className="grid grid-cols-2 sm:grid-cols-4 gap-4 text-sm pt-4 border-t">
-                <div>
-                  <p className="text-gray-500">Files processed</p>
-                  <p className="font-semibold">{summary.files_processed}</p>
-                </div>
-                <div>
-                  <p className="text-gray-500">Rows extracted</p>
-                  <p className="font-semibold">{summary.visible_rows_detected}</p>
-                </div>
-                <div>
-                  <p className="text-gray-500">Duplicates found</p>
-                  <p className="font-semibold">{summary.potential_duplicates_detected}</p>
-                </div>
-                <div>
-                  <p className="text-gray-500">Warnings</p>
-                  <p className="font-semibold">{summary.uncertain_record_count}</p>
-                </div>
-              </div>
-            )}
-            {status?.sourceFiles.some((f) => f.processingStatus === "failed") && (
-              <p className="text-red-600 text-sm">
-                {status.sourceFiles
-                  .filter((f) => f.processingStatus === "failed")
-                  .map((f) => f.errorMessage || "We could not read this file.")
-                  .join(" ")}
-              </p>
-            )}
-          </section>
-        )}
+      {/* Stepper */}
+      <div className="mb-8">
+        <ImportStepper
+          currentStep={currentStep}
+          failedStep={mode === "failed" ? "review" : undefined}
+        />
+      </div>
 
-        {mode === "preview" && (
-          <>
-            <section className="bg-white rounded-lg border p-6 space-y-4">
-              <div>
-                <h2 className="font-semibold text-lg">Column Mapping Preview</h2>
-                <p className="text-sm text-gray-700 mt-1">
-                  We detected {detectedCount} requisition rows
-                  {isRandstad ? " from your Randstad file" : ""}.
-                </p>
-                {importSummary?.headerMode === "positional_randstad" && (
-                  <p className="text-sm text-green-700 mt-1">
-                    Recognized as a Randstad requisition export (no header row required).
-                  </p>
-                )}
-              </div>
-
-              {(importSummary?.columnMapping?.length || 0) > 0 && (
-                <div className="border rounded-md overflow-hidden">
-                  <table className="min-w-full text-sm">
-                    <thead className="bg-gray-50">
-                      <tr>
-                        <th className="px-3 py-2 text-left">Source column</th>
-                        <th className="px-3 py-2 text-left">Maps to</th>
-                      </tr>
-                    </thead>
-                    <tbody className="divide-y">
-                      {importSummary!.columnMapping.map((m) => (
-                        <tr key={m.field}>
-                          <td className="px-3 py-2">{m.sourceLabel}</td>
-                          <td className="px-3 py-2">{m.targetLabel}</td>
-                        </tr>
-                      ))}
-                    </tbody>
-                  </table>
-                </div>
-              )}
-
-              {importSummary?.mappingConfidence === "low" && (
-                <p className="text-sm text-amber-700">
-                  Detection confidence is low. You can correct values on the next review step.
-                </p>
-              )}
-
-              <ImportSummaryCard
-                summary={summary}
-                importSummary={importSummary}
-                filename={status?.sourceFiles?.[0]?.originalFilename}
+      {/* Main Content Area */}
+      <div className="grid grid-cols-1 lg:grid-cols-[1fr_320px] gap-6">
+        {/* Left: Main Workflow */}
+        <div className="space-y-6">
+          {/* Processing State */}
+          {mode === "processing" && (
+            <>
+              <ImportProgressCard
+                title="Reading your Randstad export"
+                subtitle="We are detecting file encoding, headers, and requisition rows."
+                stages={processingStages}
+                currentFile={status?.sourceFiles?.[0]?.originalFilename}
+                fileProgress={{
+                  current: summary?.files_processed ?? 0,
+                  total: status?.sourceFiles?.length ?? 1,
+                }}
+                rowCount={detectedCount}
+                warningCount={summary?.uncertain_record_count}
               />
-            </section>
+              <SafeLeaveNotice />
+            </>
+          )}
 
-            <section className="bg-white rounded-lg border overflow-hidden">
-              <div className="px-4 py-3 border-b bg-gray-50">
-                <h3 className="font-semibold">Data Preview (first 10 records)</h3>
-                <p className="text-sm text-gray-600 mt-1">
-                  Please review the detected fields before continuing. You can correct any value
-                  during the review step.
-                </p>
-              </div>
-              <PreviewTable rows={previewRows} />
-            </section>
-
-            <div className="flex justify-between">
-              <Link
-                href="/requisitions/import"
-                className="px-6 py-2 border rounded-md text-sm font-medium hover:bg-gray-50"
-              >
-                Back
-              </Link>
-              <button
-                type="button"
-                onClick={() => setMode("review")}
-                className="px-6 py-2 bg-blue-600 text-white rounded-md font-medium hover:bg-blue-700"
-              >
-                Continue to Review
-              </button>
-            </div>
-          </>
-        )}
-
-        {mode === "review" && (
-          <>
-            <section className="bg-white rounded-lg border p-4 flex justify-between items-center">
-              <div>
-                <p className="font-medium">{readyRows.length} records ready for analysis</p>
-                {needsReview.length > 0 && (
-                  <p className="text-sm text-amber-600">
-                    {needsReview.length} record(s) need review (missing Req ID or bill rate)
-                  </p>
-                )}
-              </div>
-              <div className="flex gap-2">
-                <button
-                  type="button"
-                  onClick={() => setMode("preview")}
-                  className="px-4 py-2 border rounded-md text-sm font-medium hover:bg-gray-50"
+          {/* Preview State */}
+          {mode === "preview" && (
+            <>
+              {columnMappings.length > 0 && (
+                <ColumnMappingTable
+                  mappings={columnMappings}
+                  rowCount={detectedCount}
+                  encoding={importSummary?.encoding}
+                  isRandstad={isRandstad}
+                />
+              )}
+              <DataPreviewTable rows={previewRows} />
+              <div className="flex justify-between">
+                <Link
+                  href="/requisitions/import"
+                  className="px-6 py-2 text-sm font-bold text-slate-700 bg-white border border-slate-300 rounded-lg hover:bg-slate-50 transition-colors"
                 >
                   Back
-                </button>
+                </Link>
                 <button
                   type="button"
-                  disabled={analyzing || readyRows.length === 0}
-                  onClick={handleConfirmAndAnalyze}
-                  className="px-6 py-2 bg-blue-600 text-white rounded-md font-medium hover:bg-blue-700 disabled:opacity-50"
+                  onClick={() => setMode("review")}
+                  className="px-6 py-2 text-sm font-bold text-white bg-emerald-600 rounded-lg hover:bg-emerald-700 transition-colors"
                 >
-                  {analyzing ? "Analyzing…" : "Confirm and Analyze"}
+                  Continue to Review
                 </button>
               </div>
-            </section>
+            </>
+          )}
 
-            {error && <p className="text-red-600 text-sm">{error}</p>}
-
-            {needsReview.length > 0 && (
-              <section className="bg-amber-50 border border-amber-200 rounded-lg p-4">
-                <h3 className="font-semibold text-amber-900 mb-3">Needs Review</h3>
-                <ReviewTable rows={needsReview} onUpdate={updateRow} highlight />
-              </section>
-            )}
-
-            <section className="bg-white rounded-lg border overflow-hidden">
-              <h3 className="font-semibold px-4 py-3 border-b bg-gray-50">Extracted Records</h3>
-              <ReviewTable
-                rows={reviewRows.filter((r) => !needsReview.includes(r))}
-                onUpdate={updateRow}
+          {/* Review State */}
+          {mode === "review" && (
+            <>
+              <ReviewSummaryBar
+                total={reviewRows.length}
+                valid={readyRows.length}
+                needsReview={needsReview.length}
+                excluded={excludedCount}
+                canConfirm={readyRows.length > 0 && needsReview.length === 0}
+                blockingError={
+                  needsReview.length > 0
+                    ? `Resolve ${needsReview.length} missing ${needsReview.length === 1 ? "issue" : "issues"} before continuing.`
+                    : undefined
+                }
+                onBack={() => setMode("preview")}
+                onConfirm={handleConfirmAndAnalyze}
+                isConfirming={analyzing}
               />
-            </section>
-          </>
-        )}
-      </main>
-    </div>
+
+              {error && (
+                <div className="p-4 bg-red-50 border border-red-200 rounded-lg">
+                  <p className="text-sm font-bold text-red-800">{error}</p>
+                </div>
+              )}
+
+              <ReviewTable
+                rows={reviewRows}
+                onUpdate={updateRow}
+                selectedRowId={selectedRowId}
+                onSelectRow={setSelectedRowId}
+              />
+            </>
+          )}
+
+          {/* Analyzing State */}
+          {mode === "analyzing" && (
+            <>
+              <ClaudeAnalysisProgress
+                totalRequisitions={readyRows.length || detectedCount}
+                analyzedCount={0}
+                stages={analysisStages}
+              />
+              <SafeLeaveNotice />
+            </>
+          )}
+
+          {/* Failed State */}
+          {mode === "failed" && (
+            <ImportErrorCard
+              title="Import could not be completed"
+              message={error || "An error occurred during processing."}
+              batchId={batchId}
+              preservedCount={reviewRows.length}
+              onRetry={() => {
+                setError(null);
+                setMode("processing");
+                fetchStatus();
+              }}
+              onReturnToReview={() => setMode("review")}
+            />
+          )}
+
+          {/* Complete State */}
+          {mode === "complete" && completionSummary && (
+            <ImportCompletionSummary
+              sourceRows={completionSummary.sourceRowCount ?? detectedCount}
+              uniqueRequisitions={completionSummary.uniqueRequisitionCount}
+              duplicatesConsolidated={Math.max(0, (completionSummary.sourceRowCount ?? detectedCount) - completionSummary.uniqueRequisitionCount)}
+              analysesCompleted={completionSummary.analysesCompleted}
+              recordsNeedingFollowUp={completionSummary.requiresReview}
+              onViewResults={() => router.push("/?imported=1")}
+              onReviewIssues={completionSummary.requiresReview > 0 ? () => setMode("review") : undefined}
+              onNewImport={() => router.push("/requisitions/import")}
+            />
+          )}
+        </div>
+
+        {/* Right: Batch Summary Sidebar */}
+        <div className="space-y-6">
+          {status && (
+            <BatchSummaryPanel
+              batchId={batchId}
+              fileCount={status.sourceFiles?.length ?? 0}
+              status={batchStatus}
+              rowsDetected={detectedCount}
+              rowsValid={summary?.valid_rows ?? importSummary?.validRows}
+              rowsNeedingReview={summary?.rows_requiring_review ?? importSummary?.rowsRequiringReview}
+              duplicateIds={summary?.potential_duplicates_detected ?? importSummary?.duplicateRequisitionIds}
+              warnings={summary?.uncertain_record_count}
+              sourceFilename={status.sourceFiles?.[0]?.originalFilename}
+              detectedEncoding={importSummary?.encoding}
+              isCompleteList={status.batch.representsCompletePortalView}
+              startedAt={status.batch.createdAt}
+            />
+          )}
+
+          {/* File Status */}
+          {status?.sourceFiles?.some((f) => f.processingStatus === "failed") && (
+            <div className="bg-red-50 border border-red-200 rounded-xl p-4">
+              <div className="flex items-start gap-3">
+                <AlertTriangleIcon className="w-5 h-5 text-red-600 flex-shrink-0 mt-0.5" />
+                <div>
+                  <p className="text-sm font-bold text-red-800">File processing error</p>
+                  <p className="text-xs font-medium text-red-700 mt-1">
+                    {status.sourceFiles
+                      .filter((f) => f.processingStatus === "failed")
+                      .map((f) => f.errorMessage || "We could not read this file.")
+                      .join(" ")}
+                  </p>
+                </div>
+              </div>
+            </div>
+          )}
+        </div>
+      </div>
+    </ImportLayout>
   );
 }
 
-function ImportSummaryCard({
-  summary,
-  importSummary,
-  filename,
-}: {
-  summary?: BatchStatus["batch"]["processingSummary"];
-  importSummary?: ImportSummary;
-  filename?: string;
-}) {
+export default function BatchImportPage({ params }: { params: Promise<{ batchId: string }> }) {
   return (
-    <div className="border rounded-md p-4 bg-gray-50 text-sm space-y-1">
-      <h3 className="font-semibold text-base mb-2">Import Summary</h3>
-      <p>
-        <span className="text-gray-500">File:</span>{" "}
-        {importSummary?.fileName || filename || "—"}
-      </p>
-      <p>
-        <span className="text-gray-500">Encoding:</span> {importSummary?.encoding || "UTF-8"}
-      </p>
-      <p>
-        <span className="text-gray-500">Requisition rows detected:</span>{" "}
-        {importSummary?.rowsDetected ?? summary?.visible_rows_detected ?? 0}
-      </p>
-      <p>
-        <span className="text-gray-500">Valid rows:</span>{" "}
-        {importSummary?.validRows ?? summary?.valid_rows ?? 0}
-      </p>
-      <p>
-        <span className="text-gray-500">Duplicate IDs:</span>{" "}
-        {importSummary?.duplicateRequisitionIds ??
-          summary?.potential_duplicates_detected ??
-          0}
-      </p>
-      <p>
-        <span className="text-gray-500">Rows requiring review:</span>{" "}
-        {importSummary?.rowsRequiringReview ?? summary?.rows_requiring_review ?? 0}
-      </p>
-      <p>
-        <span className="text-gray-500">Missing Requisition IDs:</span>{" "}
-        {importSummary?.missingRequisitionIds ?? summary?.missing_requisition_ids ?? 0}
-      </p>
-      <p>
-        <span className="text-gray-500">Missing bill rates:</span>{" "}
-        {importSummary?.missingBillRates ?? summary?.missing_bill_rates ?? 0}
-      </p>
-      <p>
-        <span className="text-gray-500">Date parsing warnings:</span>{" "}
-        {importSummary?.dateParsingWarnings ?? summary?.date_parsing_warnings ?? 0}
-      </p>
-    </div>
-  );
-}
-
-function PreviewTable({ rows }: { rows: ReviewRow[] }) {
-  if (rows.length === 0) {
-    return <p className="p-4 text-gray-500 text-sm">No rows to display.</p>;
-  }
-
-  return (
-    <div className="overflow-x-auto">
-      <table className="min-w-full text-xs">
-        <thead className="bg-gray-50">
-          <tr>
-            <th className="px-2 py-2 text-left">Status</th>
-            <th className="px-2 py-2 text-left">Requisition ID</th>
-            <th className="px-2 py-2 text-left">Customer</th>
-            <th className="px-2 py-2 text-left">Job Title</th>
-            <th className="px-2 py-2 text-left">Submissions</th>
-            <th className="px-2 py-2 text-left">C2C Bill Rate</th>
-            <th className="px-2 py-2 text-left">Location</th>
-            <th className="px-2 py-2 text-left">Start Date</th>
-            <th className="px-2 py-2 text-left">Duration</th>
-            <th className="px-2 py-2 text-left">Positions</th>
-            <th className="px-2 py-2 text-left">Active Submissions</th>
-            <th className="px-2 py-2 text-left">Released Date</th>
-            <th className="px-2 py-2 text-left">Position Type</th>
-          </tr>
-        </thead>
-        <tbody className="divide-y">
-          {rows.map((row) => (
-            <tr key={row.id}>
-              <td className="px-2 py-2">{row.data.status || "—"}</td>
-              <td className="px-2 py-2">{row.data.requisition_id || "—"}</td>
-              <td className="px-2 py-2">{row.data.customer || "—"}</td>
-              <td className="px-2 py-2 max-w-[140px] truncate">{row.data.job_title || "—"}</td>
-              <td className="px-2 py-2">{row.data.submissions ?? "—"}</td>
-              <td className="px-2 py-2">{formatBillRate(row.data)}</td>
-              <td className="px-2 py-2">{row.data.location || "—"}</td>
-              <td className="px-2 py-2">{formatDate(row.data.start_date)}</td>
-              <td className="px-2 py-2">{row.data.duration || "—"}</td>
-              <td className="px-2 py-2">{row.data.number_of_positions ?? "—"}</td>
-              <td className="px-2 py-2">{row.data.active_submissions ?? "—"}</td>
-              <td className="px-2 py-2">{formatDate(row.data.released_date)}</td>
-              <td className="px-2 py-2">{row.data.position_type || "—"}</td>
-            </tr>
-          ))}
-        </tbody>
-      </table>
-    </div>
-  );
-}
-
-function ReviewTable({
-  rows,
-  onUpdate,
-  highlight,
-}: {
-  rows: ReviewRow[];
-  onUpdate: (id: string, updates: Record<string, unknown>) => void;
-  highlight?: boolean;
-}) {
-  if (rows.length === 0) {
-    return <p className="p-4 text-gray-500 text-sm">No rows to display.</p>;
-  }
-
-  return (
-    <div className="overflow-x-auto">
-      <table className="min-w-full text-xs">
-        <thead className="bg-gray-50">
-          <tr>
-            <th className="px-2 py-2 text-left">Include</th>
-            <th className="px-2 py-2 text-left">Source</th>
-            <th className="px-2 py-2 text-left">Conf.</th>
-            <th className="px-2 py-2 text-left">Req ID</th>
-            <th className="px-2 py-2 text-left">Customer</th>
-            <th className="px-2 py-2 text-left">Job Title</th>
-            <th className="px-2 py-2 text-left">Subs</th>
-            <th className="px-2 py-2 text-left">Bill Rate</th>
-            <th className="px-2 py-2 text-left">Location</th>
-            <th className="px-2 py-2 text-left">Start</th>
-            <th className="px-2 py-2 text-left">Duration</th>
-            <th className="px-2 py-2 text-left">Type</th>
-          </tr>
-        </thead>
-        <tbody className="divide-y">
-          {rows.map((row) => (
-            <tr key={row.id} className={highlight ? "bg-amber-50" : ""}>
-              <td className="px-2 py-2">
-                <input
-                  type="checkbox"
-                  checked={!row.excluded}
-                  onChange={(e) => onUpdate(row.id, { excluded: !e.target.checked })}
-                />
-              </td>
-              <td className="px-2 py-2 max-w-[100px] truncate" title={row.sourceFilename}>
-                {row.sourceFilename}
-                {row.sheetName && (
-                  <span className="text-gray-400 block">
-                    {row.sheetName}:{row.rowNumber}
-                  </span>
-                )}
-              </td>
-              <td className="px-2 py-2">{row.sourceConfidence}</td>
-              <td className="px-2 py-2">
-                <input
-                  className="w-24 border rounded px-1 py-0.5"
-                  value={row.data.requisition_id || ""}
-                  onChange={(e) => onUpdate(row.id, { requisition_id: e.target.value || null })}
-                />
-              </td>
-              <td className="px-2 py-2">{row.data.customer || "—"}</td>
-              <td className="px-2 py-2 max-w-[150px] truncate">{row.data.job_title || "—"}</td>
-              <td className="px-2 py-2">{row.data.submissions ?? "—"}</td>
-              <td className="px-2 py-2">
-                <input
-                  className="w-20 border rounded px-1 py-0.5"
-                  value={
-                    row.data.c2c_bill_rate_normalized ||
-                    (row.data.c2c_bill_rate != null ? String(row.data.c2c_bill_rate) : "")
-                  }
-                  onChange={(e) =>
-                    onUpdate(row.id, {
-                      c2c_bill_rate: e.target.value ? parseFloat(e.target.value) : null,
-                      c2c_bill_rate_normalized: e.target.value || null,
-                    })
-                  }
-                />
-              </td>
-              <td className="px-2 py-2">{row.data.location || "—"}</td>
-              <td className="px-2 py-2">{formatDate(row.data.start_date)}</td>
-              <td className="px-2 py-2">{row.data.duration || "—"}</td>
-              <td className="px-2 py-2">{row.data.position_type || "—"}</td>
-            </tr>
-          ))}
-        </tbody>
-      </table>
-    </div>
+    <Suspense
+      fallback={
+        <div className="min-h-screen bg-slate-50 flex items-center justify-center">
+          <div className="animate-pulse flex flex-col items-center">
+            <div className="w-12 h-12 bg-slate-200 rounded-full mb-4" />
+            <div className="h-4 w-32 bg-slate-200 rounded" />
+          </div>
+        </div>
+      }
+    >
+      <BatchImportPageContent params={params} />
+    </Suspense>
   );
 }

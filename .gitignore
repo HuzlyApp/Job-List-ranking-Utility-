@@ -40,3 +40,6 @@ yarn-error.log*
 *.tsbuildinfo
 # uploads
 .uploads/
+
+.vercel
+.env*
