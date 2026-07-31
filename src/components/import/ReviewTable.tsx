@@ -6,7 +6,7 @@ import {
   DUPLICATE_STATUSES,
   duplicateStatusBadgeClass,
   type DuplicateStatus,
-} from "@/lib/duplicate-check";
+} from "@/lib/duplicate-check-core";
 import { formatPayRange } from "@/lib/pay-range";
 
 export type ReviewFilter = "all" | "valid" | "needs_review" | "missing_id" | "missing_rate" | "duplicate" | "excluded";
