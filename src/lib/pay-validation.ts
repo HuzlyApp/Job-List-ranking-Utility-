@@ -4,8 +4,14 @@
  */
 
 import { calculatePayMidpoint, derivePayRangeFit, type PayRangeFit } from "@/lib/pay-range";
+import { parseHourlyRate } from "@/lib/pay-normalization";
 
 export type MarketPayConfidence = "High" | "Medium" | "Low";
+
+export type CalculationStatus =
+  | "complete"
+  | "incomplete_pay_unavailable"
+  | "incomplete_bill_rate_unavailable";
 
 export interface PayRecommendationInput {
   requisitionId: string;
@@ -32,6 +38,7 @@ export interface ValidatedPayRecommendation {
   payRangeFit: PayRangeFit;
   marketRateWarning: string | null;
   requiresReview: boolean;
+  calculationStatus: CalculationStatus;
   dataQualityNotes: string[];
   calculationAdjustments: string[];
 }
@@ -52,9 +59,10 @@ export function validatePayRecommendation(
   const adjustments: string[] = [];
   let requiresReview = false;
 
-  let min = finiteOrNull(input.recommendedMin);
-  let max = finiteOrNull(input.recommendedMax);
-  let floor = finiteOrNull(input.marketPayFloor);
+  // Reject zero / negative / non-finite — never coerce to 0
+  let min = parseHourlyRate(input.recommendedMin);
+  let max = parseHourlyRate(input.recommendedMax);
+  let floor = parseHourlyRate(input.marketPayFloor);
 
   // Inverted range → flag, do not invent a swap that lowers the ceiling silently
   if (min !== null && max !== null && min > max) {
@@ -85,14 +93,17 @@ export function validatePayRecommendation(
     adjustments.push("Derived market_pay_floor from recommended minimum.");
   }
 
-  // Excessively wide range
-  if (min !== null && max !== null && max - min > MAX_NARROW_RANGE_WIDTH) {
-    const reason = input.payRecommendationReason || "";
-    if (!/uncertain|partial|incomplete|wide/i.test(reason)) {
-      notes.push(
-        `Pay range width $${(max - min).toFixed(2)} exceeds typical $2–$5 band without uncertainty explanation.`
-      );
-      requiresReview = true;
+  // Typical range width $2–$5; flag wider without explanation (do not auto-shrink)
+  if (min !== null && max !== null) {
+    const width = max - min;
+    if (width > MAX_NARROW_RANGE_WIDTH) {
+      const reason = input.payRecommendationReason || "";
+      if (!/uncertain|partial|incomplete|wide/i.test(reason)) {
+        notes.push(
+          `Pay range width $${width.toFixed(2)} exceeds typical $2–$5 band without uncertainty explanation.`
+        );
+        requiresReview = true;
+      }
     }
   }
 
@@ -109,14 +120,18 @@ export function validatePayRecommendation(
     requiresReview = true;
   }
 
+  // Deterministic midpoint — never trust model midpoint when both ends exist
   const midpoint = calculatePayMidpoint(min, max);
-
-  // Verify midpoint formula when both ends present
   if (min !== null && max !== null && midpoint !== null) {
-    const expected = Math.round(((min + max) / 2) * 100) / 100;
-    if (Math.abs(midpoint - expected) > 0.01) {
-      adjustments.push("Recalculated midpoint_pay_rate from recommended range.");
-    }
+    adjustments.push("Calculated midpoint_pay_rate deterministically from recommended range.");
+  }
+
+  const payIncomplete = min === null || max === null || midpoint === null;
+  if (payIncomplete) {
+    requiresReview = true;
+    notes.push(
+      "Incomplete or invalid pay recommendation; missing values kept null (not zero)."
+    );
   }
 
   let billSupports = input.billRateSupportsMarketPay ?? null;
@@ -142,31 +157,35 @@ export function validatePayRecommendation(
     }
   }
 
+  const billIncomplete = parseHourlyRate(input.billRate) === null;
+
   const payRangeFit =
     input.payRangeFit ||
     derivePayRangeFit({
-      billRate: input.billRate ?? null,
+      billRate: parseHourlyRate(input.billRate),
       payMin: min,
       payMax: max,
-      missingRequired: input.billRate == null || min == null || max == null,
+      missingRequired: billIncomplete || payIncomplete,
     });
 
-  if (min === null || max === null) {
-    requiresReview = true;
-    notes.push("Incomplete pay recommendation; requires review.");
-  }
+  const calculationStatus: CalculationStatus = payIncomplete
+    ? "incomplete_pay_unavailable"
+    : billIncomplete
+      ? "incomplete_bill_rate_unavailable"
+      : "complete";
 
   return {
     recommendedMin: min,
     recommendedMax: max,
-    midpoint,
+    midpoint: payIncomplete ? null : midpoint,
     marketPayFloor: floor,
     marketPayConfidence: input.marketPayConfidence || "Medium",
     payRecommendationReason: input.payRecommendationReason || null,
     billRateSupportsMarketPay: billSupports,
-    payRangeFit,
+    payRangeFit: payIncomplete ? "Requires Review" : payRangeFit,
     marketRateWarning: warning,
     requiresReview,
+    calculationStatus,
     dataQualityNotes: notes,
     calculationAdjustments: adjustments,
   };
@@ -294,7 +313,3 @@ function countFilled(obj: object): number {
   ).length;
 }
 
-function finiteOrNull(n: number | null | undefined): number | null {
-  if (n === null || n === undefined) return null;
-  return Number.isFinite(n) ? n : null;
-}

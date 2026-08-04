@@ -373,15 +373,29 @@ export function Dashboard() {
       .filter((r) => r.analysis?.opportunityScore)
       .sort((a, b) => (b.analysis?.opportunityScore || 0) - (a.analysis?.opportunityScore || 0))[0];
 
-    const totalWeeklyProfit = reqs.reduce((sum, r) => {
-      return sum + parseFloat(r.analysis?.weeklyProfit || "0");
+    const completeFinancials = reqs.filter(
+      (r) =>
+        r.analysis?.estimatedProfitPerHour != null &&
+        r.analysis?.netMarginPercent != null &&
+        r.analysis?.weeklyProfit != null &&
+        Number.isFinite(parseFloat(r.analysis.estimatedProfitPerHour)) &&
+        Number.isFinite(parseFloat(r.analysis.netMarginPercent)) &&
+        Number.isFinite(parseFloat(r.analysis.weeklyProfit))
+    );
+
+    const totalWeeklyProfit = completeFinancials.reduce((sum, r) => {
+      return sum + parseFloat(r.analysis!.weeklyProfit!);
     }, 0);
-    const negativeProfitCount = reqs.filter((r) => {
-      return parseFloat(r.analysis?.estimatedProfitPerHour || "0") <= 0;
+    const negativeProfitCount = completeFinancials.filter((r) => {
+      return parseFloat(r.analysis!.estimatedProfitPerHour!) <= 0;
     }).length;
-    const avgMargin = reqs.length > 0
-      ? reqs.reduce((sum, r) => sum + parseFloat(r.analysis?.netMarginPercent || "0"), 0) / reqs.length
-      : 0;
+    const avgMargin =
+      completeFinancials.length > 0
+        ? completeFinancials.reduce(
+            (sum, r) => sum + parseFloat(r.analysis!.netMarginPercent!),
+            0
+          ) / completeFinancials.length
+        : null;
 
     const lowCompetition = reqs.filter((r) => (r.requisition.submissionCount || 0) <= 2).length;
     const highCompetition = reqs.filter((r) => (r.requisition.submissionCount || 0) > 10).length;
@@ -402,7 +416,8 @@ export function Dashboard() {
       portfolioStats: {
         estimatedWeeklyProfit: totalWeeklyProfit,
         negativeProfitCount,
-        averageNetMargin: avgMargin,
+        averageNetMargin: avgMargin ?? 0,
+        incompleteCalculations: reqs.length - completeFinancials.length,
       },
       competitionStats: {
         lowCompetitionCount: lowCompetition,

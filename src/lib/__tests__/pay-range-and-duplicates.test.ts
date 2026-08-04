@@ -26,6 +26,7 @@ describe("pay-range helpers", () => {
     expect(formatPayRange(null, null, "failed")).toBe("Analysis Failed");
     expect(formatPayRange(null, null, "requires_review")).toBe("Requires Review");
     expect(formatPayRange(null, 50)).toBe("Requires Review");
+    expect(formatPayRange(null, null)).toBe("Not available");
   });
 
   it("calculates midpoint and target scenarios", () => {
@@ -45,7 +46,13 @@ describe("pay-range helpers", () => {
 
   it("formats single pay rate", () => {
     expect(formatPayRate(62)).toBe("$62/hr");
-    expect(formatPayRate(null)).toBe("—");
+    expect(formatPayRate(null)).toBe("Not available");
+    expect(formatPayRate(0)).toBe("Not available");
+  });
+
+  it("never displays $0-$0/hr", () => {
+    expect(formatPayRange(0, 0)).toBe("Not available");
+    expect(formatPayRange("0.00", "0.00")).toBe("Not available");
   });
 
   it("derives pay range fit from bill headroom", () => {

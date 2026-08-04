@@ -26,8 +26,9 @@ export function KPICards({ requisitions }: KPICardsProps) {
       r.analysis?.finalRecommendation === "High Priority"
   ).length;
   const negativeProfit = requisitions.filter((r) => {
-    const profit = parseFloat(r.analysis?.estimatedProfitPerHour || "0");
-    return profit <= 0;
+    if (r.analysis?.estimatedProfitPerHour == null) return false;
+    const profit = parseFloat(r.analysis.estimatedProfitPerHour);
+    return Number.isFinite(profit) && profit < 0;
   }).length;
   const noLongerVisible = requisitions.filter(
     (r) => r.requisition.isNoLongerVisible

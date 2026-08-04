@@ -17,6 +17,10 @@ import {
   GROK_PAY_ANALYSIS_SYSTEM_PROMPT,
   GROK_PROMPT_VERSION,
 } from "@/ai/prompts/job-ranking-grok-v1";
+import { normalizeGrokPayAnalysisPayload } from "@/lib/pay-normalization";
+
+/** Max jobs per Grok pay-analysis request to avoid truncation / timeouts. */
+const PAY_ANALYSIS_CHUNK_SIZE = 12;
 
 // ------------------------------------------------------------------------------
 // Internal Service Interface (provider-agnostic contract preserved)
@@ -115,6 +119,24 @@ export class GrokRequisitionService implements RequisitionIntelligenceService {
   async estimatePayAndFillability(
     input: PayAndFillabilityInput
   ): Promise<ClaudePayAnalysisOutput> {
+    if (input.jobs.length === 0) {
+      return { jobs: [] };
+    }
+
+    // Chunk large batches so Grok responses stay within token/timeout limits
+    if (input.jobs.length > PAY_ANALYSIS_CHUNK_SIZE) {
+      const allJobs: ClaudePayAnalysisOutput["jobs"] = [];
+      for (let i = 0; i < input.jobs.length; i += PAY_ANALYSIS_CHUNK_SIZE) {
+        const chunk = input.jobs.slice(i, i + PAY_ANALYSIS_CHUNK_SIZE);
+        const partial = await this.estimatePayAndFillability({
+          ...input,
+          jobs: chunk,
+        });
+        allJobs.push(...partial.jobs);
+      }
+      return { jobs: allJobs };
+    }
+
     const systemPrompt = GROK_PAY_ANALYSIS_SYSTEM_PROMPT;
     const userContent = this.buildPayAnalysisUserContent(input);
     const { text } = await this.callGrok(systemPrompt, userContent, {
@@ -122,13 +144,15 @@ export class GrokRequisitionService implements RequisitionIntelligenceService {
       maxTokens: 8192,
     });
     const parsed = this.extractJsonFromResponse(text);
+    const normalized = normalizeGrokPayAnalysisPayload(parsed);
 
     const validated = await this.validateWithRepair(
-      parsed,
+      normalized,
       ClaudePayAnalysisSchema,
       systemPrompt,
       userContent,
-      8192
+      8192,
+      /* normalizeOnRepair */ true
     );
 
     return validated as ClaudePayAnalysisOutput;
@@ -260,7 +284,8 @@ export class GrokRequisitionService implements RequisitionIntelligenceService {
     schema: T,
     systemPrompt: string,
     userContent: ChatCompletionContentPart[],
-    maxTokens: number
+    maxTokens: number,
+    normalizeOnRepair = false
   ): Promise<z.infer<T>> {
     const initial = schema.safeParse(data);
     if (initial.success) {
@@ -271,6 +296,11 @@ export class GrokRequisitionService implements RequisitionIntelligenceService {
       .map((i) => `${i.path.join(".")}: ${i.message}`)
       .join("\n");
 
+    console.warn("[grok.validation.failed]", {
+      issueCount: initial.error.issues.length,
+      sample: validationErrors.slice(0, 500),
+    });
+
     const repairContent: ChatCompletionContentPart[] = [
       {
         type: "text",
@@ -278,6 +308,12 @@ export class GrokRequisitionService implements RequisitionIntelligenceService {
 
 Validation errors:
 ${validationErrors}
+
+CRITICAL PAY FIELD RULES:
+- recommended_w2_pay_min and recommended_w2_pay_max must be positive numbers (e.g. 72) or null
+- Do NOT return currency strings, "/hr" suffixes, or zero when uncertain — use null
+- market_pay_floor must be a positive number or null
+- Do not invent zero-dollar pay recommendations
 
 Expected schema matches the original system prompt. Return corrected JSON only.`,
       },
@@ -298,7 +334,10 @@ Expected schema matches the original system prompt. Return corrected JSON only.`
       repairUserContent,
       { jsonObject: true, maxTokens }
     );
-    const repairedData = this.extractJsonFromResponse(repairResponse);
+    let repairedData = this.extractJsonFromResponse(repairResponse);
+    if (normalizeOnRepair) {
+      repairedData = normalizeGrokPayAnalysisPayload(repairedData);
+    }
 
     const repaired = schema.safeParse(repairedData);
     if (repaired.success) {

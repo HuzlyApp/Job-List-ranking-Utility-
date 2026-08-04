@@ -1,3 +1,8 @@
+import {
+  calculateDeterministicMidpoint,
+  parseHourlyRate,
+} from "@/lib/pay-normalization";
+
 export type PayRangeFit =
   | "Strong Fit"
   | "Workable"
@@ -14,20 +19,18 @@ export type PayRangeDisplayStatus =
   | "failed"
   | "requires_review";
 
+/** @deprecated Prefer parseHourlyRate — kept as alias for existing call sites. */
 export function parsePayNumber(
   value: string | number | null | undefined
 ): number | null {
-  if (value === null || value === undefined || value === "") return null;
-  const n = typeof value === "number" ? value : Number.parseFloat(value);
-  return Number.isFinite(n) ? n : null;
+  return parseHourlyRate(value);
 }
 
 export function calculatePayMidpoint(
   min: number | null,
   max: number | null
 ): number | null {
-  if (min === null || max === null) return null;
-  return Math.round(((min + max) / 2) * 100) / 100;
+  return calculateDeterministicMidpoint(min, max);
 }
 
 export function resolveTargetPayRate(options: {
@@ -37,14 +40,19 @@ export function resolveTargetPayRate(options: {
   customRate?: number | null;
 }): number | null {
   const { min, max, scenario = "midpoint", customRate } = options;
-  if (scenario === "custom") return customRate ?? null;
+  if (scenario === "custom") {
+    return parseHourlyRate(customRate);
+  }
   if (min === null || max === null) return null;
-  if (scenario === "minimum") return min;
-  if (scenario === "maximum") return max;
+  if (scenario === "minimum") return parseHourlyRate(min);
+  if (scenario === "maximum") return parseHourlyRate(max);
   return calculatePayMidpoint(min, max);
 }
 
-/** Format as `$52–$54/hr` from numeric min/max. */
+/**
+ * Format recommended pay range for display.
+ * Never renders $0-$0/hr — invalid/missing values show Not available / Requires Review.
+ */
 export function formatPayRange(
   min: string | number | null | undefined,
   max: string | number | null | undefined,
@@ -54,8 +62,10 @@ export function formatPayRange(
   if (status === "failed") return "Analysis Failed";
   if (status === "requires_review") return "Requires Review";
 
-  const lo = parsePayNumber(min);
-  const hi = parsePayNumber(max);
+  const lo = parseHourlyRate(min);
+  const hi = parseHourlyRate(max);
+
+  if (lo === null && hi === null) return "Not available";
   if (lo === null || hi === null) return "Requires Review";
 
   const fmt = (n: number) =>
@@ -63,12 +73,45 @@ export function formatPayRange(
   return `${fmt(lo)}–${fmt(hi)}/hr`;
 }
 
+/**
+ * Format a single hourly rate. Never renders $0/hr for invalid values.
+ */
 export function formatPayRate(
   value: string | number | null | undefined
 ): string {
-  const n = parsePayNumber(value);
-  if (n === null) return "—";
+  const n = parseHourlyRate(value);
+  if (n === null) return "Not available";
   return Number.isInteger(n) ? `$${n}/hr` : `$${n.toFixed(2)}/hr`;
+}
+
+/**
+ * Safe currency formatter for profit / financial metrics.
+ * Null or non-finite → "Not available".
+ */
+export function formatMoneyMetric(
+  value: string | number | null | undefined
+): string {
+  if (value === null || value === undefined || value === "") {
+    return "Not available";
+  }
+  const n = typeof value === "number" ? value : Number.parseFloat(String(value));
+  if (!Number.isFinite(n)) return "Not available";
+  const sign = n < 0 ? "-" : "";
+  return `${sign}$${Math.abs(n).toFixed(2)}`;
+}
+
+/**
+ * Safe percent formatter. Null or non-finite → "Not available".
+ */
+export function formatPercentMetric(
+  value: string | number | null | undefined
+): string {
+  if (value === null || value === undefined || value === "") {
+    return "Not available";
+  }
+  const n = typeof value === "number" ? value : Number.parseFloat(String(value));
+  if (!Number.isFinite(n)) return "Not available";
+  return `${n.toFixed(1)}%`;
 }
 
 /**
@@ -127,6 +170,12 @@ export function buildPayFirstExplanation(input: {
   netMarginPercent?: number | null;
 }): string {
   const range = formatPayRange(input.payMin, input.payMax);
+  if (range === "Not available" || range === "Requires Review") {
+    return `Pay recommendation unavailable. Marked for review.${
+      input.marketRateWarning ? ` ${input.marketRateWarning}` : ""
+    }`.trim();
+  }
+
   const fill = input.fillabilityLabel
     ? ` The role has ${input.fillabilityLabel.toLowerCase()} candidate availability`
     : "";

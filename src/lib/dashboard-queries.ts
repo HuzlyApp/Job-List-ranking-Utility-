@@ -204,7 +204,7 @@ export async function getDashboardKpis(tenantId: string, mspProgramId?: string):
       averageOpportunityScore: sql<number | null>`avg(${requisitionAnalysisResults.opportunityScore}) filter (where ${requisitionAnalysisResults.opportunityScore} is not null)`,
       strongPayRangeFit: sql<number>`count(*) filter (where ${requisitionAnalysisResults.payRangeFit} = 'Strong Fit')::int`,
       belowMarket: sql<number>`count(*) filter (where ${requisitionAnalysisResults.payRangeFit} = 'Below Market')::int`,
-      averageTargetPay: sql<number | null>`round(avg(${requisitionAnalysisResults.selectedPayRate}) filter (where ${requisitionAnalysisResults.selectedPayRate} is not null), 2)`,
+      averageTargetPay: sql<number | null>`round(avg(${requisitionAnalysisResults.selectedPayRate}) filter (where ${requisitionAnalysisResults.selectedPayRate} is not null and ${requisitionAnalysisResults.selectedPayRate}::numeric > 0), 2)`,
     })
     .from(requisitions)
     .leftJoin(

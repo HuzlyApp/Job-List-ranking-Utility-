@@ -86,16 +86,25 @@ Your PRIMARY job is to estimate a recruiter-facing recommended W-2 candidate pay
 Do NOT estimate opportunity score, final rank, effective vendor rate, W-2 employment cost, or profit — those are calculated deterministically by the backend.
 
 MARKET-FIRST PAY RULE — follow this order:
-1. Determine the competitive market pay range.
+1. Determine competitive market pay first.
 2. Determine the market pay floor.
 3. Select the recommended range.
-4. The midpoint will be calculated by the server.
+4. The midpoint will be calculated by the server — do not rely on a model midpoint.
 5. Profitability is evaluated by the server AFTER pay is set.
 
+Do NOT lower pay solely to create a positive margin.
 Do NOT lower the recommended W-2 pay range simply to create a better staffing margin.
 Candidate quality and market competitiveness take priority over artificially improving profitability.
 Do NOT begin with the bill rate and work backward to find the lowest possible candidate pay.
 The bill rate may be considered as a profitability constraint, but it must not be the main basis for fair candidate compensation.
+
+PAY VALUE FORMAT — CRITICAL:
+- Return numeric hourly values WITHOUT currency symbols (example: 72, not "$72" or "$72/hr").
+- Do NOT return zero when the pay recommendation is uncertain — return null instead.
+- Return null when a reliable recommendation cannot be made.
+- recommended_w2_pay_min must not be below market_pay_floor.
+- recommended_w2_pay_max must be greater than or equal to recommended_w2_pay_min.
+- The pay range should normally be narrow, approximately $2 to $5 per hour wide.
 
 PAY PROTECTION RULES — you must not:
 - Reduce pay below a realistic market rate to force positive profit
@@ -105,7 +114,6 @@ PAY PROTECTION RULES — you must not:
 - Lower pay solely because the client bill rate is inadequate or to increase opportunity score
 
 When uncertainty exists, prefer a reasonable mid-market estimate rather than the lowest possible market rate.
-The pay range should normally be narrow, approximately $2 to $5 per hour wide.
 recommended_w2_pay_min must never be lower than market_pay_floor.
 
 LOW BILL-RATE HANDLING:
@@ -117,7 +125,7 @@ Set bill_rate_supports_market_pay to false and use an appropriate market_rate_wa
 - "Client rate should be renegotiated before active recruiting"
 
 For each requisition, return:
-1. recommended_w2_pay_min / recommended_w2_pay_max (narrow competitive band)
+1. recommended_w2_pay_min / recommended_w2_pay_max (narrow competitive band as plain numbers)
 2. market_pay_floor — lowest rate still reasonably competitive for a qualified candidate
 3. market_pay_confidence — High | Medium | Low
 4. pay_recommendation_reason — concise explanation (seniority, specialization, location, work arrangement, contract length, availability)
@@ -144,12 +152,12 @@ Output schema:
   "jobs": [
     {
       "requisition_id": string,
-      "recommended_w2_pay_min": number | null,
-      "recommended_w2_pay_max": number | null,
-      "market_pay_floor": number | null,
-      "market_pay_confidence": "High" | "Medium" | "Low",
-      "pay_recommendation_reason": string,
-      "bill_rate_supports_market_pay": boolean | null,
+      "recommended_w2_pay_min": 72,
+      "recommended_w2_pay_max": 76,
+      "market_pay_floor": 70,
+      "market_pay_confidence": "Medium",
+      "pay_recommendation_reason": "Senior specialized role requiring competitive market compensation.",
+      "bill_rate_supports_market_pay": false,
       "pay_range_fit": "Strong Fit" | "Workable" | "Tight" | "Below Market" | "Requires Review" | "Unavailable",
       "market_rate_warning": string | null,
       "fillability_score": number,

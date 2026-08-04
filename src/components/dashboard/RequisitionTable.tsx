@@ -2,6 +2,7 @@
 
 import { useState } from "react";
 import Link from "next/link";
+import { formatPayRange } from "@/lib/pay-range";
 
 interface RequisitionWithAnalysis {
   requisition: {
@@ -92,14 +93,16 @@ export function RequisitionTable({ data, onPageChange }: RequisitionTableProps) 
   };
 
   const formatCurrency = (value: string | null | undefined) => {
-    if (!value) return "-";
+    if (value === null || value === undefined || value === "") return "Not available";
     const num = parseFloat(value);
+    if (!Number.isFinite(num)) return "Not available";
     return `$${num.toFixed(2)}`;
   };
 
   const formatPercent = (value: string | null | undefined) => {
-    if (!value) return "-";
+    if (value === null || value === undefined || value === "") return "Not available";
     const num = parseFloat(value);
+    if (!Number.isFinite(num)) return "Not available";
     return `${num.toFixed(1)}%`;
   };
 
@@ -273,10 +276,11 @@ export function RequisitionTable({ data, onPageChange }: RequisitionTableProps) 
                   </td>
                   <td className="px-3 py-4 whitespace-nowrap text-sm text-gray-900">
                     {analysis
-                      ? `${formatCurrency(analysis.recommendedPayMin)} - ${formatCurrency(
+                      ? formatPayRange(
+                          analysis.recommendedPayMin,
                           analysis.recommendedPayMax
-                        )}`
-                      : "-"}
+                        )
+                      : "Not available"}
                   </td>
                   <td
                     className={`px-3 py-4 whitespace-nowrap text-sm font-medium ${

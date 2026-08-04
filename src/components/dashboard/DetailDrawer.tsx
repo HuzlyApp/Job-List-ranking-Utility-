@@ -11,6 +11,8 @@ import {
 import {
   formatPayRange,
   formatPayRate,
+  formatMoneyMetric,
+  formatPercentMetric,
   payRangeFitBadgeClass,
   type PayRangeFit,
 } from "@/lib/pay-range";
@@ -83,15 +85,11 @@ export function DetailDrawer({ requisition, onClose, isOpen }: DetailDrawerProps
 
   const analysis = requisition.analysis;
 
-  const formatCurrency = (value: string | null | undefined) => {
-    if (!value) return "-";
-    return `$${parseFloat(value).toFixed(2)}`;
-  };
+  const formatCurrency = (value: string | null | undefined) =>
+    formatMoneyMetric(value);
 
-  const formatPercent = (value: string | null | undefined) => {
-    if (!value) return "-";
-    return `${parseFloat(value).toFixed(1)}%`;
-  };
+  const formatPercent = (value: string | null | undefined) =>
+    formatPercentMetric(value);
 
   return (
     <>
@@ -264,9 +262,21 @@ export function DetailDrawer({ requisition, onClose, isOpen }: DetailDrawerProps
                     {formatCurrency(analysis.effectiveVendorRate)}
                   </p>
                 </div>
-                <div className={`p-3 rounded-lg ${parseFloat(analysis.estimatedProfitPerHour || "0") < 0 ? "bg-red-50" : "bg-emerald-50"}`}>
+                <div className={`p-3 rounded-lg ${
+                  analysis.estimatedProfitPerHour != null &&
+                  Number.isFinite(parseFloat(analysis.estimatedProfitPerHour)) &&
+                  parseFloat(analysis.estimatedProfitPerHour) < 0
+                    ? "bg-red-50"
+                    : "bg-emerald-50"
+                }`}>
                   <p className="text-xs text-slate-500">Est. Profit/Hr</p>
-                  <p className={`text-lg font-semibold tabular-nums ${parseFloat(analysis.estimatedProfitPerHour || "0") < 0 ? "text-red-600" : "text-emerald-600"}`}>
+                  <p className={`text-lg font-semibold tabular-nums ${
+                    analysis.estimatedProfitPerHour != null &&
+                    Number.isFinite(parseFloat(analysis.estimatedProfitPerHour)) &&
+                    parseFloat(analysis.estimatedProfitPerHour) < 0
+                      ? "text-red-600"
+                      : "text-emerald-600"
+                  }`}>
                     {formatCurrency(analysis.estimatedProfitPerHour)}
                   </p>
                 </div>

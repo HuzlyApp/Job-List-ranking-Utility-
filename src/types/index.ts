@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { parseHourlyRate } from "@/lib/pay-normalization";
 
 // =============================================================================
 // Extraction Schemas (Operation 1: Extract and Normalize)
@@ -47,19 +48,25 @@ export type ClaudeExtractionOutput = z.infer<typeof ClaudeExtractionSchema>;
 // Pay and Fillability Schemas (Operation 2: Pay and Fillability Analysis)
 // =============================================================================
 
+/** Accepts numbers, numeric strings, currency strings; rejects zero/negative → null */
+const HourlyRateSchema = z
+  .unknown()
+  .transform((val) => parseHourlyRate(val))
+  .pipe(z.number().positive().nullable());
+
 export const ClaudePayAnalysisItemSchema = z.object({
   requisition_id: z.string().min(1),
 
   // Preferred field names (pay-range first)
-  recommended_pay_min: z.number().nonnegative().nullable().optional(),
-  recommended_pay_max: z.number().nonnegative().nullable().optional(),
+  recommended_pay_min: HourlyRateSchema.optional(),
+  recommended_pay_max: HourlyRateSchema.optional(),
   // Canonical / Grok field names
-  recommended_w2_pay_min: z.number().nonnegative().nullable().optional(),
-  recommended_w2_pay_max: z.number().nonnegative().nullable().optional(),
+  recommended_w2_pay_min: HourlyRateSchema.optional(),
+  recommended_w2_pay_max: HourlyRateSchema.optional(),
 
-  market_pay_floor: z.number().nonnegative().nullable().optional(),
-  market_pay_confidence: z.enum(["High", "Medium", "Low"]).optional(),
-  pay_recommendation_reason: z.string().min(1).optional(),
+  market_pay_floor: HourlyRateSchema.optional(),
+  market_pay_confidence: z.enum(["High", "Medium", "Low"]).nullable().optional(),
+  pay_recommendation_reason: z.string().min(1).nullable().optional(),
   bill_rate_supports_market_pay: z.boolean().nullable().optional(),
 
   pay_range_confidence: z.enum(["High", "Medium", "Low"]).optional().default("Medium"),
@@ -77,7 +84,7 @@ export const ClaudePayAnalysisItemSchema = z.object({
     ])
     .optional(),
 
-  market_rate_warning: z.string().nullable(),
+  market_rate_warning: z.string().nullable().optional(),
 
   fillability_score: z.number().min(0).max(100),
   fillability_label: z.enum([
@@ -122,7 +129,7 @@ export const ClaudePayAnalysisItemSchema = z.object({
     pay_estimate_reason,
     pay_range_reason: pay_estimate_reason,
     pay_range_fit: item.pay_range_fit,
-    market_rate_warning: item.market_rate_warning,
+    market_rate_warning: item.market_rate_warning ?? null,
     fillability_score: item.fillability_score,
     fillability_label: item.fillability_label,
     fillability_reason: item.fillability_reason,

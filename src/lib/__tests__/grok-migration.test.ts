@@ -158,9 +158,9 @@ describe("deterministic financials (authoritative)", () => {
       roleRiskClassification: "Standard",
       assumptions,
     });
-    expect(financials.effectiveVendorRate.toNumber()).toBe(98);
-    expect(financials.grossSpreadPerHour.toNumber()).toBe(24);
-    expect(financials.estimatedProfitPerHour.lt(0) || financials.estimatedProfitPerHour.gte(0)).toBe(
+    expect(financials.effectiveVendorRate!.toNumber()).toBe(98);
+    expect(financials.grossSpreadPerHour!.toNumber()).toBe(24);
+    expect(financials.estimatedProfitPerHour!.lt(0) || financials.estimatedProfitPerHour!.gte(0)).toBe(
       true
     );
     // Negative profit must remain negative if pay is high
@@ -174,8 +174,8 @@ describe("deterministic financials (authoritative)", () => {
       roleRiskClassification: "Standard",
       assumptions,
     });
-    expect(weak.estimatedProfitPerHour.lt(0)).toBe(true);
-    expect(calculateProfitabilityScore(weak.estimatedProfitPerHour)).toBe(0);
+    expect(weak.estimatedProfitPerHour!.lt(0)).toBe(true);
+    expect(calculateProfitabilityScore(weak.estimatedProfitPerHour!)).toBe(0);
   });
 
   it("matches opportunity score formula and continuous ranks", () => {

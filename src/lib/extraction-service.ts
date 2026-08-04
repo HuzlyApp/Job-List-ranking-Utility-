@@ -11,7 +11,6 @@ import {
 } from "@/db/schema";
 import { eq, and, sql } from "drizzle-orm";
 import { v4 as uuidv4 } from "uuid";
-import Decimal from "decimal.js";
 import type { ExtractedRequisition, FinancialAssumptions, ScoringWeights } from "@/types";
 import { createRequisitionIntelligenceService } from "@/lib/ai-providers";
 import {
@@ -48,6 +47,7 @@ import {
   dedupeByRequisitionId,
   normalizeRequisitionId,
 } from "@/lib/pay-validation";
+import { decimalOrNull } from "@/lib/pay-normalization";
 import { GROK_MODEL } from "@/lib/grok-provider";
 import { GROK_PROMPT_VERSION } from "@/ai/prompts/job-ranking-grok-v1";
 
@@ -1065,15 +1065,21 @@ export async function finalizeBatch(
       });
     }
 
-    const payMin = payValidated.recommendedMin || 0;
-    const payMax = payValidated.recommendedMax || 0;
-    const payMidpoint = payValidated.midpoint ?? (payMin + payMax) / 2;
+    // NEVER coerce missing pay to 0 — keep null
+    const payMin = payValidated.recommendedMin;
+    const payMax = payValidated.recommendedMax;
+    const payMidpoint = payValidated.midpoint;
     const payRangeFit = payValidated.payRangeFit;
+    const payAvailable =
+      payMin !== null &&
+      payMax !== null &&
+      payMidpoint !== null &&
+      payMidpoint > 0;
     const payEstimateReason =
       payValidated.payRecommendationReason ||
       buildPayFirstExplanation({
-        payMin: payMin || null,
-        payMax: payMax || null,
+        payMin,
+        payMax,
         payRangeFit,
         fillabilityLabel: getFillabilityLabel(analyzedRow.fillability_score || 50),
         submissionCount: row.submissions,
@@ -1101,53 +1107,60 @@ export async function finalizeBatch(
       roleRisk = "Higher-Risk Technical";
     }
 
-    // Calculate financials
-    let financials;
-    let requiresHealthcareReview = false;
-    
-    try {
+    const billRateRaw =
+      row.c2c_bill_rate_normalized || row.c2c_bill_rate || null;
+    const billRateNumber =
+      billRateRaw === null || billRateRaw === undefined
+        ? null
+        : parsePayNumber(
+            typeof billRateRaw === "number" ? billRateRaw : String(billRateRaw)
+          );
+
+    // Calculate financials — never use zero pay
+    let financials = calculateFinancials({
+      displayedVendorRate: billRateNumber,
+      selectedPayRate: payAvailable ? payMidpoint : null,
+      vendorFeeType: program.vendorFeeType as "percentage" | "flat_hourly" | "none",
+      vendorFeeValue: parseFloat(program.vendorFeeValue),
+      weeklyHours: program.defaultWeeklyHours,
+      durationWeeks,
+      roleRiskClassification: roleRisk,
+      assumptions,
+    });
+
+    const requiresHealthcareReview = roleRisk === "Healthcare";
+    if (requiresHealthcareReview && financials.status === "complete") {
+      // Healthcare WC rate needs manual review; use Standard burden for interim display
       financials = calculateFinancials({
-        displayedVendorRate: new Decimal(
-          row.c2c_bill_rate_normalized || row.c2c_bill_rate || 0
-        ),
-        selectedPayRate: payMidpoint,
+        displayedVendorRate: billRateNumber,
+        selectedPayRate: payAvailable ? payMidpoint : null,
         vendorFeeType: program.vendorFeeType as "percentage" | "flat_hourly" | "none",
         vendorFeeValue: parseFloat(program.vendorFeeValue),
         weeklyHours: program.defaultWeeklyHours,
         durationWeeks,
-        roleRiskClassification: roleRisk,
+        roleRiskClassification: "Standard",
         assumptions,
       });
-    } catch (e) {
-      if (roleRisk === "Healthcare") {
-        requiresHealthcareReview = true;
-        // Recalculate with standard rate
-        financials = calculateFinancials({
-          displayedVendorRate: new Decimal(
-            row.c2c_bill_rate_normalized || row.c2c_bill_rate || 0
-          ),
-          selectedPayRate: payMidpoint,
-          vendorFeeType: program.vendorFeeType as "percentage" | "flat_hourly" | "none",
-          vendorFeeValue: parseFloat(program.vendorFeeValue),
-          weeklyHours: program.defaultWeeklyHours,
-          durationWeeks,
-          roleRiskClassification: "Standard",
-          assumptions,
-        });
-      } else {
-        throw e;
-      }
     }
+
+    const financialsComplete = financials.status === "complete";
+    const calculationStatusLabel =
+      financials.status === "incomplete_pay_unavailable"
+        ? "Incomplete - pay recommendation unavailable"
+        : financials.status === "incomplete_bill_rate_unavailable"
+          ? "Incomplete - bill rate unavailable"
+          : "complete";
 
     // Calculate scores
     const scores = calculateScores(
       {
         submissionCount: row.submissions,
-        profitPerHour: financials.estimatedProfitPerHour.toNumber(),
+        profitPerHour: financials.estimatedProfitPerHour?.toNumber() ?? null,
         fillabilityScore: analyzedRow.fillability_score || 50,
-        effectiveVendorRate: financials.effectiveVendorRate.toNumber(),
+        effectiveVendorRate: financials.effectiveVendorRate?.toNumber() ?? null,
         durationWeeks,
         requiresHealthcareReview,
+        payAvailable: payAvailable && financialsComplete,
       },
       weights
     );
@@ -1320,7 +1333,10 @@ export async function finalizeBatch(
     if (reqRecord) {
       // Upsert analysis result
       let recommendation = getRecommendationLabel(scores.opportunityScore);
-      const negativeProfit = financials.estimatedProfitPerHour.lte(0);
+      const negativeProfit =
+        financialsComplete &&
+        financials.estimatedProfitPerHour !== null &&
+        financials.estimatedProfitPerHour.lte(0);
       const billUnsupported = payValidated.billRateSupportsMarketPay === false;
 
       // High opportunity score must not hide negative operating margin / inadequate bill
@@ -1337,7 +1353,51 @@ export async function finalizeBatch(
       const requiresManualReview =
         requiresHealthcareReview ||
         payValidated.requiresReview ||
-        analyzedRow.requires_pay_review === true;
+        analyzedRow.requires_pay_review === true ||
+        !payAvailable ||
+        !financialsComplete;
+
+      const payEstimateReasonFinal =
+        !payAvailable || !financialsComplete
+          ? `${payEstimateReason} [${calculationStatusLabel}]`
+          : payEstimateReason;
+
+      const analysisPayFields = {
+        recommendedPayMin: decimalOrNull(payMin),
+        recommendedPayMax: decimalOrNull(payMax),
+        payMidpoint: decimalOrNull(payMidpoint),
+        selectedPayRate: decimalOrNull(payMidpoint),
+        payScenario: "midpoint" as const,
+        payEstimateReason: payEstimateReasonFinal,
+        payRangeConfidence: payValidated.marketPayConfidence || "Medium",
+        payRangeFit,
+        marketRateWarning: payValidated.marketRateWarning || null,
+        marketPayFloor: decimalOrNull(payValidated.marketPayFloor),
+        billRateSupportsMarketPay: payValidated.billRateSupportsMarketPay,
+        roleRiskClassification: roleRisk,
+        effectiveVendorRate: financials.effectiveVendorRate?.toString() ?? null,
+        estimatedW2Cost: financials.w2CostPerHour?.toString() ?? null,
+        grossSpreadPerHour: financials.grossSpreadPerHour?.toString() ?? null,
+        estimatedProfitPerHour:
+          financials.estimatedProfitPerHour?.toString() ?? null,
+        netMarginPercent: financials.netMarginPercent?.toString() ?? null,
+        weeklyProfit: financials.weeklyProfit?.toString() ?? null,
+        assignmentProfit: financials.assignmentProfit?.toString() ?? null,
+        competitionScore: scores.competitionScore,
+        profitabilityScore: financialsComplete
+          ? scores.profitabilityScore
+          : null,
+        fillabilityScore: scores.fillabilityScore,
+        fillabilityLabel: getFillabilityLabel(scores.fillabilityScore),
+        billRateScore: scores.billRateScore,
+        durationScore: scores.durationScore,
+        opportunityScore: scores.opportunityScore,
+        calculatedRecommendation: recommendation,
+        finalRecommendation: recommendation,
+        requiresManualReview,
+        claudeModel: GROK_MODEL,
+        promptVersion: GROK_PROMPT_VERSION,
+      };
       
       await db
         .insert(requisitionAnalysisResults)
@@ -1346,73 +1406,14 @@ export async function finalizeBatch(
           tenantId,
           requisitionId: reqRecord.id,
           batchId,
-          recommendedPayMin: payMin.toString(),
-          recommendedPayMax: payMax.toString(),
-          payMidpoint: payMidpoint.toString(),
-          selectedPayRate: payMidpoint.toString(),
-          payScenario: "midpoint",
-          payEstimateReason: payEstimateReason,
-          payRangeConfidence: payValidated.marketPayConfidence || "Medium",
-          payRangeFit,
-          marketRateWarning: payValidated.marketRateWarning || null,
-          marketPayFloor: payValidated.marketPayFloor?.toString() || null,
-          billRateSupportsMarketPay: payValidated.billRateSupportsMarketPay,
-          roleRiskClassification: roleRisk,
-          effectiveVendorRate: financials.effectiveVendorRate.toString(),
-          estimatedW2Cost: financials.w2CostPerHour.toString(),
-          grossSpreadPerHour: financials.grossSpreadPerHour.toString(),
-          estimatedProfitPerHour: financials.estimatedProfitPerHour.toString(),
-          netMarginPercent: financials.netMarginPercent.toString(),
-          weeklyProfit: financials.weeklyProfit.toString(),
-          assignmentProfit: financials.assignmentProfit?.toString() || null,
-          competitionScore: scores.competitionScore,
-          profitabilityScore: scores.profitabilityScore,
-          fillabilityScore: scores.fillabilityScore,
-          fillabilityLabel: getFillabilityLabel(scores.fillabilityScore),
-          billRateScore: scores.billRateScore,
-          durationScore: scores.durationScore,
-          opportunityScore: scores.opportunityScore,
+          ...analysisPayFields,
           rank: 0, // Will be updated after all calculations
-          calculatedRecommendation: recommendation,
-          finalRecommendation: recommendation,
-          requiresManualReview,
-          claudeModel: GROK_MODEL,
-          promptVersion: GROK_PROMPT_VERSION,
         })
         .onConflictDoUpdate({
           target: [requisitionAnalysisResults.requisitionId],
           set: {
             batchId,
-            recommendedPayMin: payMin.toString(),
-            recommendedPayMax: payMax.toString(),
-            payMidpoint: payMidpoint.toString(),
-            selectedPayRate: payMidpoint.toString(),
-            payEstimateReason: payEstimateReason,
-            payRangeConfidence: payValidated.marketPayConfidence || "Medium",
-            payRangeFit,
-            marketRateWarning: payValidated.marketRateWarning || null,
-            marketPayFloor: payValidated.marketPayFloor?.toString() || null,
-            billRateSupportsMarketPay: payValidated.billRateSupportsMarketPay,
-            roleRiskClassification: roleRisk,
-            effectiveVendorRate: financials.effectiveVendorRate.toString(),
-            estimatedW2Cost: financials.w2CostPerHour.toString(),
-            grossSpreadPerHour: financials.grossSpreadPerHour.toString(),
-            estimatedProfitPerHour: financials.estimatedProfitPerHour.toString(),
-            netMarginPercent: financials.netMarginPercent.toString(),
-            weeklyProfit: financials.weeklyProfit.toString(),
-            assignmentProfit: financials.assignmentProfit?.toString() || null,
-            competitionScore: scores.competitionScore,
-            profitabilityScore: scores.profitabilityScore,
-            fillabilityScore: scores.fillabilityScore,
-            fillabilityLabel: getFillabilityLabel(scores.fillabilityScore),
-            billRateScore: scores.billRateScore,
-            durationScore: scores.durationScore,
-            opportunityScore: scores.opportunityScore,
-            calculatedRecommendation: recommendation,
-            finalRecommendation: recommendation,
-            requiresManualReview,
-            claudeModel: GROK_MODEL,
-            promptVersion: GROK_PROMPT_VERSION,
+            ...analysisPayFields,
             updatedAt: new Date(),
           },
         });
@@ -1425,27 +1426,27 @@ export async function finalizeBatch(
         requisitionId: reqRecord.id,
         batchId,
         sourceValues: row,
-        recommendedPayMin: payMin.toString(),
-        recommendedPayMax: payMax.toString(),
-        payMidpoint: payMidpoint.toString(),
-        selectedPayRate: payMidpoint.toString(),
+        recommendedPayMin: analysisPayFields.recommendedPayMin,
+        recommendedPayMax: analysisPayFields.recommendedPayMax,
+        payMidpoint: analysisPayFields.payMidpoint,
+        selectedPayRate: analysisPayFields.selectedPayRate,
         payScenario: "midpoint",
-        payEstimateReason: payEstimateReason,
-        payRangeConfidence: payValidated.marketPayConfidence || "Medium",
+        payEstimateReason: analysisPayFields.payEstimateReason,
+        payRangeConfidence: analysisPayFields.payRangeConfidence,
         payRangeFit,
-        marketRateWarning: payValidated.marketRateWarning || null,
-        marketPayFloor: payValidated.marketPayFloor?.toString() || null,
-        billRateSupportsMarketPay: payValidated.billRateSupportsMarketPay,
+        marketRateWarning: analysisPayFields.marketRateWarning,
+        marketPayFloor: analysisPayFields.marketPayFloor,
+        billRateSupportsMarketPay: analysisPayFields.billRateSupportsMarketPay,
         roleRiskClassification: roleRisk,
-        effectiveVendorRate: financials.effectiveVendorRate.toString(),
-        estimatedW2Cost: financials.w2CostPerHour.toString(),
-        grossSpreadPerHour: financials.grossSpreadPerHour.toString(),
-        estimatedProfitPerHour: financials.estimatedProfitPerHour.toString(),
-        netMarginPercent: financials.netMarginPercent.toString(),
-        weeklyProfit: financials.weeklyProfit.toString(),
-        assignmentProfit: financials.assignmentProfit?.toString() || null,
+        effectiveVendorRate: analysisPayFields.effectiveVendorRate,
+        estimatedW2Cost: analysisPayFields.estimatedW2Cost,
+        grossSpreadPerHour: analysisPayFields.grossSpreadPerHour,
+        estimatedProfitPerHour: analysisPayFields.estimatedProfitPerHour,
+        netMarginPercent: analysisPayFields.netMarginPercent,
+        weeklyProfit: analysisPayFields.weeklyProfit,
+        assignmentProfit: analysisPayFields.assignmentProfit,
         competitionScore: scores.competitionScore,
-        profitabilityScore: scores.profitabilityScore,
+        profitabilityScore: analysisPayFields.profitabilityScore,
         fillabilityScore: scores.fillabilityScore,
         fillabilityLabel: getFillabilityLabel(scores.fillabilityScore),
         billRateScore: scores.billRateScore,
@@ -1459,10 +1460,11 @@ export async function finalizeBatch(
         id: reqRecord.id,
         requisitionId: row.requisition_id,
         opportunityScore: scores.opportunityScore,
-        estimatedProfitPerHour: financials.estimatedProfitPerHour.toNumber(),
+        estimatedProfitPerHour:
+          financials.estimatedProfitPerHour?.toNumber() ?? 0,
         submissionCount: row.submissions,
         durationWeeks,
-        effectiveVendorRate: financials.effectiveVendorRate.toNumber(),
+        effectiveVendorRate: financials.effectiveVendorRate?.toNumber() ?? 0,
         releasedDate: row.released_date ? new Date(row.released_date) : null,
         requiresManualReview,
       });

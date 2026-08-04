@@ -9,7 +9,7 @@ Decimal.set({
 
 export interface RequisitionFinancialInput {
   displayedVendorRate: Decimal | number | null;
-  selectedPayRate: Decimal | number;
+  selectedPayRate: Decimal | number | null;
   vendorFeeType: "percentage" | "flat_hourly" | "none";
   vendorFeeValue: Decimal | number;
   weeklyHours: Decimal | number;
@@ -18,23 +18,30 @@ export interface RequisitionFinancialInput {
   assumptions: FinancialAssumptions;
 }
 
+export type FinancialCalculationStatus =
+  | "complete"
+  | "incomplete_pay_unavailable"
+  | "incomplete_bill_rate_unavailable";
+
 export interface RequisitionFinancialOutput {
-  effectiveVendorRate: Decimal;
-  grossSpreadPerHour: Decimal;
-  w2CostPerHour: Decimal;
-  estimatedProfitPerHour: Decimal;
-  netMarginPercent: Decimal;
-  weeklyProfit: Decimal;
+  status: FinancialCalculationStatus;
+  effectiveVendorRate: Decimal | null;
+  grossSpreadPerHour: Decimal | null;
+  w2CostPerHour: Decimal | null;
+  estimatedProfitPerHour: Decimal | null;
+  netMarginPercent: Decimal | null;
+  weeklyProfit: Decimal | null;
   assignmentProfit: Decimal | null;
 }
 
 export interface RequisitionScoresInput {
   submissionCount: number | null;
-  profitPerHour: Decimal | number;
+  profitPerHour: Decimal | number | null;
   fillabilityScore: number;
-  effectiveVendorRate: Decimal | number;
+  effectiveVendorRate: Decimal | number | null;
   durationWeeks: Decimal | number | null;
   requiresHealthcareReview: boolean;
+  payAvailable?: boolean;
 }
 
 export interface RequisitionScoresOutput {
@@ -111,7 +118,8 @@ export function calculateW2CostPerHour(
 }
 
 /**
- * Calculate all financial metrics for a requisition
+ * Calculate all financial metrics for a requisition.
+ * Never calculates profit using a zero or missing pay rate.
  */
 export function calculateFinancials(
   input: RequisitionFinancialInput
@@ -127,8 +135,33 @@ export function calculateFinancials(
     assumptions,
   } = input;
 
-  if (!displayedVendorRate) {
-    throw new Error("Displayed vendor rate is required for financial calculations");
+  const incomplete = (
+    status: FinancialCalculationStatus
+  ): RequisitionFinancialOutput => ({
+    status,
+    effectiveVendorRate: null,
+    grossSpreadPerHour: null,
+    w2CostPerHour: null,
+    estimatedProfitPerHour: null,
+    netMarginPercent: null,
+    weeklyProfit: null,
+    assignmentProfit: null,
+  });
+
+  if (
+    displayedVendorRate === null ||
+    displayedVendorRate === undefined ||
+    new Decimal(displayedVendorRate).lte(0)
+  ) {
+    return incomplete("incomplete_bill_rate_unavailable");
+  }
+
+  if (
+    selectedPayRate === null ||
+    selectedPayRate === undefined ||
+    !new Decimal(selectedPayRate).gt(0)
+  ) {
+    return incomplete("incomplete_pay_unavailable");
   }
 
   const effectiveVendorRate = calculateEffectiveVendorRate(
@@ -137,22 +170,23 @@ export function calculateFinancials(
     vendorFeeValue
   );
 
-  const grossSpreadPerHour = effectiveVendorRate.minus(new Decimal(selectedPayRate));
+  if (!effectiveVendorRate.gt(0)) {
+    return incomplete("incomplete_bill_rate_unavailable");
+  }
+
+  const pay = new Decimal(selectedPayRate);
+  const grossSpreadPerHour = effectiveVendorRate.minus(pay);
 
   let w2CostPerHour: Decimal;
   if (roleRiskClassification === "Healthcare") {
     w2CostPerHour = new Decimal(0);
   } else {
-    w2CostPerHour = calculateW2CostPerHour(selectedPayRate, roleRiskClassification, assumptions);
+    w2CostPerHour = calculateW2CostPerHour(pay, roleRiskClassification, assumptions);
   }
 
-  const estimatedProfitPerHour = effectiveVendorRate
-    .minus(new Decimal(selectedPayRate))
-    .minus(w2CostPerHour);
+  const estimatedProfitPerHour = effectiveVendorRate.minus(pay).minus(w2CostPerHour);
 
-  const netMarginPercent = effectiveVendorRate.gt(0)
-    ? estimatedProfitPerHour.div(effectiveVendorRate).mul(100)
-    : new Decimal(0);
+  const netMarginPercent = estimatedProfitPerHour.div(effectiveVendorRate).mul(100);
 
   const weeklyProfit = estimatedProfitPerHour.mul(weeklyHours);
 
@@ -162,6 +196,7 @@ export function calculateFinancials(
   }
 
   return {
+    status: "complete",
     effectiveVendorRate,
     grossSpreadPerHour,
     w2CostPerHour,
@@ -247,11 +282,21 @@ export function calculateScores(
     effectiveVendorRate,
     durationWeeks,
     requiresHealthcareReview,
+    payAvailable = true,
   } = input;
 
   const competitionScore = calculateCompetitionScore(submissionCount);
-  const profitabilityScore = requiresHealthcareReview ? 0 : calculateProfitabilityScore(profitPerHour);
-  const billRateScore = calculateBillRateScore(effectiveVendorRate);
+  const profitabilityScore =
+    requiresHealthcareReview ||
+    !payAvailable ||
+    profitPerHour === null ||
+    profitPerHour === undefined
+      ? 0
+      : calculateProfitabilityScore(profitPerHour);
+  const billRateScore =
+    effectiveVendorRate === null || effectiveVendorRate === undefined
+      ? 0
+      : calculateBillRateScore(effectiveVendorRate);
   const durationScore = calculateDurationScore(durationWeeks);
 
   const totalWeight =

@@ -107,11 +107,12 @@ describe("Financial Calculations", () => {
 
       const result = calculateFinancials(input);
 
-      expect(result.effectiveVendorRate.toNumber()).toBe(98);
-      expect(result.grossSpreadPerHour.toNumber()).toBe(18);
-      expect(result.estimatedProfitPerHour.toNumber()).toBeCloseTo(8.43, 2);
-      expect(result.netMarginPercent.toNumber()).toBeCloseTo(8.6, 1);
-      expect(result.weeklyProfit.toNumber()).toBeCloseTo(337.2, 1);
+      expect(result.status).toBe("complete");
+      expect(result.effectiveVendorRate!.toNumber()).toBe(98);
+      expect(result.grossSpreadPerHour!.toNumber()).toBe(18);
+      expect(result.estimatedProfitPerHour!.toNumber()).toBeCloseTo(8.43, 2);
+      expect(result.netMarginPercent!.toNumber()).toBeCloseTo(8.6, 1);
+      expect(result.weeklyProfit!.toNumber()).toBeCloseTo(337.2, 1);
       expect(result.assignmentProfit?.toNumber()).toBeCloseTo(8767.2, 1);
     });
 
@@ -128,7 +129,23 @@ describe("Financial Calculations", () => {
       };
 
       const result = calculateFinancials(input);
+      expect(result.status).toBe("complete");
       expect(result.assignmentProfit).toBeNull();
+    });
+
+    it("should not calculate when pay rate is missing", () => {
+      const result = calculateFinancials({
+        displayedVendorRate: 100,
+        selectedPayRate: null,
+        vendorFeeType: "percentage",
+        vendorFeeValue: 2,
+        weeklyHours: 40,
+        durationWeeks: 26,
+        roleRiskClassification: "Standard",
+        assumptions,
+      });
+      expect(result.status).toBe("incomplete_pay_unavailable");
+      expect(result.estimatedProfitPerHour).toBeNull();
     });
   });
 

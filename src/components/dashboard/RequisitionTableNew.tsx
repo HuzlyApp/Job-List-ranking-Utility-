@@ -10,6 +10,9 @@ import {
 import {
   formatPayRange,
   formatPayRate,
+  formatMoneyMetric,
+  formatPercentMetric,
+  parsePayNumber,
   payRangeFitBadgeClass,
   type PayRangeFit,
 } from "@/lib/pay-range";
@@ -115,17 +118,11 @@ export function RequisitionTable({ data, onPageChange, onRowClick, isLoading }: 
     }
   };
 
-  const formatCurrency = (value: string | null | undefined) => {
-    if (!value) return "-";
-    const num = parseFloat(value);
-    return `$${num.toFixed(2)}`;
-  };
+  const formatCurrency = (value: string | null | undefined) =>
+    formatMoneyMetric(value);
 
-  const formatPercent = (value: string | null | undefined) => {
-    if (!value) return "-";
-    const num = parseFloat(value);
-    return `${num.toFixed(1)}%`;
-  };
+  const formatPercent = (value: string | null | undefined) =>
+    formatPercentMetric(value);
 
   const getRecommendationBadge = (recommendation: string | null | undefined) => {
     const styles: Record<string, string> = {
@@ -359,8 +356,8 @@ export function RequisitionTable({ data, onPageChange, onRowClick, isLoading }: 
               const analysis = item.analysis;
               const isSelected = selectedRows.has(req.id);
               const hasRecommendedPayRange =
-                analysis?.recommendedPayMin != null &&
-                analysis?.recommendedPayMax != null;
+                parsePayNumber(analysis?.recommendedPayMin) != null &&
+                parsePayNumber(analysis?.recommendedPayMax) != null;
               const recommendedPayRange = formatPayRange(
                 analysis?.recommendedPayMin,
                 analysis?.recommendedPayMax,
