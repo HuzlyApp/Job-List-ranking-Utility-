@@ -618,21 +618,80 @@ export async function runPayAnalysis(
     return;
   }
 
+  const writeProgress = async (progress: {
+    analyzed: number;
+    total: number;
+    currentChunk: number;
+    totalChunks: number;
+    stage: string;
+  }) => {
+    const [existing] = await db
+      .select({ processingSummary: requisitionAnalysisBatches.processingSummary })
+      .from(requisitionAnalysisBatches)
+      .where(eq(requisitionAnalysisBatches.id, batchId));
+    const summary = {
+      ...((existing?.processingSummary as Record<string, unknown>) || {}),
+      pay_analysis_progress: progress,
+    };
+    await db
+      .update(requisitionAnalysisBatches)
+      .set({ processingSummary: summary, updatedAt: new Date() })
+      .where(eq(requisitionAnalysisBatches.id, batchId));
+  };
+
   try {
+    await writeProgress({
+      analyzed: 0,
+      total: jobs.length,
+      currentChunk: 0,
+      totalChunks: Math.ceil(jobs.length / 8),
+      stage: "analyzing_grok",
+    });
+
     const provider = createRequisitionIntelligenceService();
     const analysis = await provider.estimatePayAndFillability({
       jobs,
       promptVersion: GROK_PROMPT_VERSION,
+      onProgress: writeProgress,
     });
 
-    const analysisByReqId = new Map(analysis.jobs.map((j) => [j.requisition_id, j]));
+    const analysisByReqId = new Map(
+      analysis.jobs.map((j) => [j.requisition_id, j] as const)
+    );
 
     for (const row of rows) {
       const data = (row.confirmedJson || row.extractedJson) as ExtractedRequisition;
       const reqId = normalizeRequisitionId(data.requisition_id);
       if (!reqId) continue;
       const pay = analysisByReqId.get(reqId);
-      if (!pay) continue;
+
+      if (!pay) {
+        const enriched = {
+          ...data,
+          requisition_id: reqId,
+          recommended_w2_pay_min: null,
+          recommended_w2_pay_max: null,
+          market_pay_floor: null,
+          bill_rate_supports_market_pay: null,
+          pay_estimate_reason:
+            "Grok pay analysis unavailable for this requisition. Requires manual market pay review.",
+          pay_range_confidence: "Low" as const,
+          pay_range_fit: "Requires Review" as const,
+          market_rate_warning: "Pay analysis missing; do not recruit until pay is reviewed",
+          fillability_score: 50,
+          fillability_label: "Difficult" as const,
+          requires_pay_review: true,
+          data_quality_notes: [
+            ...(Array.isArray(data.data_quality_notes) ? data.data_quality_notes : []),
+            "No Grok pay result for this requisition (chunk failed or omitted).",
+          ],
+        };
+        await db
+          .update(requisitionSourceRows)
+          .set({ confirmedJson: enriched })
+          .where(eq(requisitionSourceRows.id, row.id));
+        continue;
+      }
 
       const validated = validatePayRecommendation({
         requisitionId: reqId,
@@ -686,8 +745,23 @@ export async function runPayAnalysis(
         .set({ confirmedJson: enriched })
         .where(eq(requisitionSourceRows.id, row.id));
     }
+
+    await writeProgress({
+      analyzed: jobs.length,
+      total: jobs.length,
+      currentChunk: Math.ceil(jobs.length / 8),
+      totalChunks: Math.ceil(jobs.length / 8),
+      stage: "complete",
+    });
   } catch (err) {
     console.error("Pay analysis failed; marking rows for review (no bill-rate pay cut):", err);
+    await writeProgress({
+      analyzed: 0,
+      total: jobs.length,
+      currentChunk: 0,
+      totalChunks: Math.ceil(jobs.length / 8),
+      stage: "failed",
+    });
     for (const row of rows) {
       const data = (row.confirmedJson || row.extractedJson) as ExtractedRequisition;
       if (!data.requisition_id) continue;
@@ -1572,6 +1646,26 @@ export async function finalizeBatch(
     analysisRecordsCreated,
     analysisRecordsReused,
   };
+}
+
+/**
+ * Mark a batch as failed with a sanitized error (avoids stuck analyzing/calculating).
+ */
+export async function markBatchFailed(
+  batchId: string,
+  errorCode: string,
+  message: string
+): Promise<void> {
+  await db
+    .update(requisitionAnalysisBatches)
+    .set({
+      status: "failed",
+      errorCode,
+      sanitizedErrorMessage: message.slice(0, 500),
+      completedAt: new Date(),
+      updatedAt: new Date(),
+    })
+    .where(eq(requisitionAnalysisBatches.id, batchId));
 }
 
 /**

@@ -56,10 +56,19 @@ interface BatchStatus {
       missing_bill_rates?: number;
       date_parsing_warnings?: number;
       import_summaries?: ImportSummary[];
+      pay_analysis_progress?: {
+        analyzed: number;
+        total: number;
+        currentChunk: number;
+        totalChunks: number;
+        stage: string;
+      };
     };
     mspProgramId: string;
     createdAt?: string;
     representsCompletePortalView?: boolean;
+    sanitizedErrorMessage?: string | null;
+    errorCode?: string | null;
   };
   sourceFiles: Array<{
     id: string;
@@ -155,17 +164,17 @@ function BatchImportPageContent({ params }: { params: Promise<{ batchId: string 
     params.then((p) => setBatchId(p.batchId));
   }, [params]);
 
-  const applyBatchStatus = useCallback((batchStatus: string | undefined) => {
+  const applyBatchStatus = useCallback((batchStatus: string | undefined, errorMessage?: string | null) => {
     if (!batchStatus) return;
     if (batchStatus === "awaiting_review" || batchStatus === "reviewing") {
-      setMode((prev) => (prev === "review" ? "review" : "preview"));
+      setMode((prev) => (prev === "analyzing" || prev === "failed" ? "review" : prev === "review" ? "review" : "preview"));
     } else if (batchStatus === "analyzing" || batchStatus === "calculating") {
       setMode("analyzing");
     } else if (batchStatus === "completed" || batchStatus === "partially_completed") {
       setMode("complete");
     } else if (batchStatus === "failed" || batchStatus === "cancelled") {
       setMode("failed");
-      setError("Import failed. Please try uploading the file again.");
+      setError(errorMessage || "Import failed. Return to review and retry analysis.");
     } else {
       setMode("processing");
     }
@@ -190,7 +199,7 @@ function BatchImportPageContent({ params }: { params: Promise<{ batchId: string 
         payload?.batch?.status ||
         payload?.status ||
         (typeof payload === "string" ? payload : undefined);
-      applyBatchStatus(batchStatus);
+      applyBatchStatus(batchStatus, payload?.batch?.sanitizedErrorMessage);
     } catch {
       setError("Could not refresh import status. Retrying…");
     }
@@ -237,6 +246,7 @@ function BatchImportPageContent({ params }: { params: Promise<{ batchId: string 
     if (!status) return;
     setAnalyzing(true);
     setError(null);
+    setMode("analyzing");
     try {
       await fetch(`/api/batches/${batchId}`, {
         method: "POST",
@@ -266,7 +276,10 @@ function BatchImportPageContent({ params }: { params: Promise<{ batchId: string 
       setCompletionSummary(payload.summary);
       setMode("complete");
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Analysis failed");
+      const message = err instanceof Error ? err.message : "Analysis failed";
+      setError(message);
+      setMode("failed");
+      await fetchStatus();
     } finally {
       setAnalyzing(false);
     }
@@ -332,17 +345,50 @@ function BatchImportPageContent({ params }: { params: Promise<{ batchId: string 
     }));
   }, [batchStatus, status, importSummary, detectedCount, summary]);
 
-  // Build analysis stages
-  const analysisStages = [
-    { id: "prepare", label: "Preparing source data", status: "complete" as const },
-    { id: "send1", label: "Analyzing with Grok", status: "active" as const },
-    { id: "validate1", label: "Validating Grok response", status: "pending" as const },
-    { id: "pay", label: "Verifying pay recommendations", status: "pending" as const },
-    { id: "calc", label: "Calculating financial results", status: "pending" as const },
-    { id: "dedupe", label: "Removing duplicates", status: "pending" as const },
-    { id: "rank", label: "Ranking requisitions", status: "pending" as const },
-    { id: "save", label: "Saving requisitions", status: "pending" as const },
-  ];
+  // Build analysis stages from live progress
+  const payProgress = summary?.pay_analysis_progress;
+  const analyzedCount = payProgress?.analyzed ?? 0;
+  const analysisTotal =
+    payProgress?.total || readyRows.length || detectedCount || 0;
+  const analysisStages = useMemo(() => {
+    const stage = payProgress?.stage || "analyzing_grok";
+    const grokDone = stage === "complete" || batchStatus === "calculating";
+    const calculating = batchStatus === "calculating";
+    return [
+      { id: "prepare", label: "Preparing source data", status: "complete" as const },
+      {
+        id: "send1",
+        label: "Analyzing with Grok",
+        status: grokDone ? ("complete" as const) : ("active" as const),
+      },
+      {
+        id: "validate1",
+        label: "Validating Grok response",
+        status: grokDone
+          ? ("complete" as const)
+          : stage === "analyzing_grok"
+            ? ("pending" as const)
+            : ("active" as const),
+      },
+      {
+        id: "pay",
+        label: "Verifying pay recommendations",
+        status: calculating || grokDone ? ("complete" as const) : ("pending" as const),
+      },
+      {
+        id: "calc",
+        label: "Calculating financial results",
+        status: calculating
+          ? ("active" as const)
+          : batchStatus === "completed"
+            ? ("complete" as const)
+            : ("pending" as const),
+      },
+      { id: "dedupe", label: "Removing duplicates", status: "pending" as const },
+      { id: "rank", label: "Ranking requisitions", status: "pending" as const },
+      { id: "save", label: "Saving requisitions", status: "pending" as const },
+    ];
+  }, [payProgress?.stage, batchStatus]);
 
   // Preview rows
   const previewRows = useMemo(
@@ -516,8 +562,10 @@ function BatchImportPageContent({ params }: { params: Promise<{ batchId: string 
           {mode === "analyzing" && (
             <>
               <ClaudeAnalysisProgress
-                totalRequisitions={readyRows.length || detectedCount}
-                analyzedCount={0}
+                totalRequisitions={analysisTotal}
+                analyzedCount={analyzedCount}
+                currentBatch={payProgress?.currentChunk}
+                totalBatches={payProgress?.totalChunks}
                 stages={analysisStages}
               />
               <SafeLeaveNotice />
@@ -527,16 +575,24 @@ function BatchImportPageContent({ params }: { params: Promise<{ batchId: string 
           {/* Failed State */}
           {mode === "failed" && (
             <ImportErrorCard
-              title="Import could not be completed"
-              message={error || "An error occurred during processing."}
+              title="Analysis could not be completed"
+              message={
+                error ||
+                status?.batch?.sanitizedErrorMessage ||
+                "An error occurred during Grok analysis or saving results."
+              }
               batchId={batchId}
               preservedCount={reviewRows.length}
               onRetry={() => {
                 setError(null);
-                setMode("processing");
-                fetchStatus();
+                setMode("review");
+                fetchReview();
               }}
-              onReturnToReview={() => setMode("review")}
+              onReturnToReview={() => {
+                setError(null);
+                setMode("review");
+                fetchReview();
+              }}
             />
           )}
 

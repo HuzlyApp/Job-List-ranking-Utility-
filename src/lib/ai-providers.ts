@@ -20,21 +20,31 @@ import {
 import { normalizeGrokPayAnalysisPayload } from "@/lib/pay-normalization";
 
 /** Max jobs per Grok pay-analysis request to avoid truncation / timeouts. */
-const PAY_ANALYSIS_CHUNK_SIZE = 12;
+const PAY_ANALYSIS_CHUNK_SIZE = 8;
 
-// ------------------------------------------------------------------------------
-// Internal Service Interface (provider-agnostic contract preserved)
-// ------------------------------------------------------------------------------
+export type PayAnalysisProgress = {
+  analyzed: number;
+  total: number;
+  currentChunk: number;
+  totalChunks: number;
+  stage: "analyzing_grok" | "validating" | "complete" | "failed";
+};
 
-export interface RequisitionIntelligenceService {
-  extractRequisitions(
-    input: RequisitionExtractionInput
-  ): Promise<ClaudeExtractionOutput>;
-
-  estimatePayAndFillability(
-    input: PayAndFillabilityInput
-  ): Promise<ClaudePayAnalysisOutput>;
-}
+export interface PayAndFillabilityInput {
+  jobs: Array<{
+    requisition_id: string;
+    job_title: string | null;
+    customer: string | null;
+    location: string | null;
+    duration: string | null;
+    c2c_bill_rate: number | null;
+    position_type: string | null;
+    remote_or_onsite: string | null;
+    submissions: number | null;
+  }>;
+  promptVersion: string;
+  onProgress?: (progress: PayAnalysisProgress) => void | Promise<void>;
+};
 
 export interface RequisitionExtractionInput {
   images?: Array<{
@@ -50,19 +60,14 @@ export interface RequisitionExtractionInput {
   promptVersion: string;
 }
 
-export interface PayAndFillabilityInput {
-  jobs: Array<{
-    requisition_id: string;
-    job_title: string | null;
-    customer: string | null;
-    location: string | null;
-    duration: string | null;
-    c2c_bill_rate: number | null;
-    position_type: string | null;
-    remote_or_onsite: string | null;
-    submissions: number | null;
-  }>;
-  promptVersion: string;
+export interface RequisitionIntelligenceService {
+  extractRequisitions(
+    input: RequisitionExtractionInput
+  ): Promise<ClaudeExtractionOutput>;
+
+  estimatePayAndFillability(
+    input: PayAndFillabilityInput
+  ): Promise<ClaudePayAnalysisOutput>;
 }
 
 export type GrokCallMeta = {
@@ -123,22 +128,59 @@ export class GrokRequisitionService implements RequisitionIntelligenceService {
       return { jobs: [] };
     }
 
-    // Chunk large batches so Grok responses stay within token/timeout limits
-    if (input.jobs.length > PAY_ANALYSIS_CHUNK_SIZE) {
-      const allJobs: ClaudePayAnalysisOutput["jobs"] = [];
-      for (let i = 0; i < input.jobs.length; i += PAY_ANALYSIS_CHUNK_SIZE) {
-        const chunk = input.jobs.slice(i, i + PAY_ANALYSIS_CHUNK_SIZE);
-        const partial = await this.estimatePayAndFillability({
-          ...input,
-          jobs: chunk,
-        });
+    const total = input.jobs.length;
+    const totalChunks = Math.max(1, Math.ceil(total / PAY_ANALYSIS_CHUNK_SIZE));
+    const allJobs: ClaudePayAnalysisOutput["jobs"] = [];
+    let analyzed = 0;
+
+    for (let chunkIndex = 0; chunkIndex < totalChunks; chunkIndex++) {
+      const start = chunkIndex * PAY_ANALYSIS_CHUNK_SIZE;
+      const chunk = input.jobs.slice(start, start + PAY_ANALYSIS_CHUNK_SIZE);
+
+      await input.onProgress?.({
+        analyzed,
+        total,
+        currentChunk: chunkIndex + 1,
+        totalChunks,
+        stage: "analyzing_grok",
+      });
+
+      try {
+        const partial = await this.estimatePayChunk(chunk, input.promptVersion);
         allJobs.push(...partial.jobs);
+      } catch (err) {
+        const message = err instanceof Error ? err.message : "Grok chunk failed";
+        console.error("[grok.pay.chunk.failed]", {
+          chunk: chunkIndex + 1,
+          totalChunks,
+          jobCount: chunk.length,
+          error: message,
+        });
+        // Continue other chunks — missing pay stays null rather than failing the whole batch
       }
-      return { jobs: allJobs };
+
+      analyzed = Math.min(total, analyzed + chunk.length);
+      await input.onProgress?.({
+        analyzed,
+        total,
+        currentChunk: chunkIndex + 1,
+        totalChunks,
+        stage: chunkIndex + 1 >= totalChunks ? "complete" : "analyzing_grok",
+      });
     }
 
+    return { jobs: allJobs };
+  }
+
+  private async estimatePayChunk(
+    jobs: PayAndFillabilityInput["jobs"],
+    promptVersion: string
+  ): Promise<ClaudePayAnalysisOutput> {
     const systemPrompt = GROK_PAY_ANALYSIS_SYSTEM_PROMPT;
-    const userContent = this.buildPayAnalysisUserContent(input);
+    const userContent = this.buildPayAnalysisUserContent({
+      jobs,
+      promptVersion,
+    });
     const { text } = await this.callGrok(systemPrompt, userContent, {
       jsonObject: true,
       maxTokens: 8192,

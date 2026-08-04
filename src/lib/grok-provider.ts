@@ -1,8 +1,8 @@
 import "server-only";
 import OpenAI from "openai";
 
-const timeout = Number(process.env.GROK_TIMEOUT_MS || 120000);
-const maxRetries = Number(process.env.GROK_MAX_RETRIES || 2);
+const timeout = Number(process.env.GROK_TIMEOUT_MS || 60000);
+const maxRetries = Number(process.env.GROK_MAX_RETRIES || 1);
 
 /**
  * Centralized default Grok model (vision-capable).

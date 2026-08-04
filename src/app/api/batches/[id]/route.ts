@@ -8,7 +8,10 @@ import {
   updateSourceRow,
   confirmReviewRows,
   runPayAnalysis,
+  markBatchFailed,
 } from "@/lib/extraction-service";
+
+export const maxDuration = 300;
 
 const processSchema = z.object({
   action: z.enum([
@@ -55,8 +58,9 @@ export async function POST(
   request: NextRequest,
   { params }: { params: Promise<{ id: string }> }
 ) {
+  let batchId = "";
   try {
-    const { id: batchId } = await params;
+    ({ id: batchId } = await params);
     const body = await request.json();
     const validated = processSchema.parse(body);
 
@@ -105,6 +109,11 @@ export async function POST(
         validated.weights
       );
       if (summary.uniqueRequisitionCount === 0) {
+        await markBatchFailed(
+          batchId,
+          "ZERO_FINALIZED",
+          "No requisitions were finalized"
+        );
         return NextResponse.json(
           {
             success: false,
@@ -120,6 +129,15 @@ export async function POST(
     return NextResponse.json({ error: "Invalid action" }, { status: 400 });
   } catch (error) {
     console.error("Error processing batch:", error);
+    if (batchId) {
+      const message =
+        error instanceof Error ? error.message : "Failed to process batch";
+      try {
+        await markBatchFailed(batchId, "PROCESSING_ERROR", message.slice(0, 500));
+      } catch (markErr) {
+        console.error("Failed to mark batch failed:", markErr);
+      }
+    }
     if (error instanceof z.ZodError) {
       return NextResponse.json({ error: error.issues }, { status: 400 });
     }
