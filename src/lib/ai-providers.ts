@@ -132,6 +132,8 @@ export class GrokRequisitionService implements RequisitionIntelligenceService {
     const totalChunks = Math.max(1, Math.ceil(total / PAY_ANALYSIS_CHUNK_SIZE));
     const allJobs: ClaudePayAnalysisOutput["jobs"] = [];
     let analyzed = 0;
+    let failedChunks = 0;
+    const chunkErrors: string[] = [];
 
     for (let chunkIndex = 0; chunkIndex < totalChunks; chunkIndex++) {
       const start = chunkIndex * PAY_ANALYSIS_CHUNK_SIZE;
@@ -148,24 +150,45 @@ export class GrokRequisitionService implements RequisitionIntelligenceService {
       try {
         const partial = await this.estimatePayChunk(chunk, input.promptVersion);
         allJobs.push(...partial.jobs);
+        analyzed = Math.min(total, analyzed + partial.jobs.length);
       } catch (err) {
+        failedChunks += 1;
         const message = err instanceof Error ? err.message : "Grok chunk failed";
+        chunkErrors.push(`chunk ${chunkIndex + 1}: ${message}`);
         console.error("[grok.pay.chunk.failed]", {
           chunk: chunkIndex + 1,
           totalChunks,
           jobCount: chunk.length,
+          model: this.model,
           error: message,
         });
         // Continue other chunks — missing pay stays null rather than failing the whole batch
       }
 
-      analyzed = Math.min(total, analyzed + chunk.length);
       await input.onProgress?.({
         analyzed,
         total,
         currentChunk: chunkIndex + 1,
         totalChunks,
         stage: chunkIndex + 1 >= totalChunks ? "complete" : "analyzing_grok",
+      });
+    }
+
+    if (allJobs.length === 0) {
+      const detail = chunkErrors.slice(0, 3).join("; ") || "unknown error";
+      throw new Error(
+        `Grok returned no pay recommendations for ${total} jobs ` +
+          `(${failedChunks}/${totalChunks} chunks failed). ${detail}. ` +
+          `Verify GROK_MODEL (current: ${this.model}) and XAI_API_KEY.`
+      );
+    }
+
+    if (failedChunks > 0) {
+      console.warn("[grok.pay.partial]", {
+        succeededJobs: allJobs.length,
+        totalJobs: total,
+        failedChunks,
+        totalChunks,
       });
     }
 

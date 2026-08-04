@@ -108,7 +108,7 @@ DATABASE_URL=postgresql://user:pass@host/db?sslmode=require
 # AI Provider (xAI Grok — server-side only)
 XAI_API_KEY=xai-...
 GROK_BASE_URL=https://api.x.ai/v1
-GROK_MODEL=grok-2-vision-1212
+GROK_MODEL=grok-4.5
 GROK_TIMEOUT_MS=120000
 GROK_MAX_RETRIES=2
 

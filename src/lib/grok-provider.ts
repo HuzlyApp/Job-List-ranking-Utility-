@@ -7,8 +7,9 @@ const maxRetries = Number(process.env.GROK_MAX_RETRIES || 1);
 /**
  * Centralized default Grok model (vision-capable).
  * Override with GROK_MODEL — do not hardcode elsewhere.
+ * grok-2-vision-1212 was deprecated by xAI (2026-02-28).
  */
-const DEFAULT_GROK_MODEL = "grok-2-vision-1212";
+const DEFAULT_GROK_MODEL = "grok-4.5";
 
 export const GROK_MODEL = process.env.GROK_MODEL || DEFAULT_GROK_MODEL;
 
@@ -48,7 +49,7 @@ export const grokClient = {
  * Models known to support image input. If GROK_MODEL is set to a text-only
  * model and images are supplied, callers must fail clearly.
  */
-const VISION_MODEL_HINTS = ["vision", "grok-2", "grok-3", "grok-4"];
+const VISION_MODEL_HINTS = ["vision", "grok-2", "grok-3", "grok-4", "grok-4.5"];
 
 export function assertGrokSupportsImages(model: string = GROK_MODEL): void {
   const lower = model.toLowerCase();
@@ -56,7 +57,7 @@ export function assertGrokSupportsImages(model: string = GROK_MODEL): void {
   if (!supports) {
     throw new Error(
       `Configured Grok model "${model}" does not support image input. ` +
-        `Set GROK_MODEL to a vision-capable model (e.g. grok-2-vision-1212).`
+        `Set GROK_MODEL to a vision-capable model (e.g. grok-4.5).`
     );
   }
 }
