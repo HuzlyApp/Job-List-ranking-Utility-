@@ -334,12 +334,14 @@ function BatchImportPageContent({ params }: { params: Promise<{ batchId: string 
 
   // Build analysis stages
   const analysisStages = [
-    { id: "prepare", label: "Preparing confirmed data", status: "complete" as const },
-    { id: "send1", label: "Sending batch 1 to Claude", status: "active" as const },
-    { id: "validate1", label: "Validating batch 1 response", status: "pending" as const },
-    { id: "calc", label: "Calculating profitability", status: "pending" as const },
-    { id: "rank", label: "Ranking opportunities", status: "pending" as const },
-    { id: "save", label: "Saving results", status: "pending" as const },
+    { id: "prepare", label: "Preparing source data", status: "complete" as const },
+    { id: "send1", label: "Analyzing with Grok", status: "active" as const },
+    { id: "validate1", label: "Validating Grok response", status: "pending" as const },
+    { id: "pay", label: "Verifying pay recommendations", status: "pending" as const },
+    { id: "calc", label: "Calculating financial results", status: "pending" as const },
+    { id: "dedupe", label: "Removing duplicates", status: "pending" as const },
+    { id: "rank", label: "Ranking requisitions", status: "pending" as const },
+    { id: "save", label: "Saving requisitions", status: "pending" as const },
   ];
 
   // Preview rows

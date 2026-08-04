@@ -122,8 +122,11 @@ export async function listRequisitionsWithAnalysis(params: RequisitionListParams
       selectedPayRate: requisitionAnalysisResults.selectedPayRate,
       payScenario: requisitionAnalysisResults.payScenario,
       payEstimateReason: requisitionAnalysisResults.payEstimateReason,
+      payRangeConfidence: requisitionAnalysisResults.payRangeConfidence,
       payRangeFit: requisitionAnalysisResults.payRangeFit,
       marketRateWarning: requisitionAnalysisResults.marketRateWarning,
+      marketPayFloor: requisitionAnalysisResults.marketPayFloor,
+      billRateSupportsMarketPay: requisitionAnalysisResults.billRateSupportsMarketPay,
       roleRiskClassification: requisitionAnalysisResults.roleRiskClassification,
       effectiveVendorRate: requisitionAnalysisResults.effectiveVendorRate,
       estimatedW2Cost: requisitionAnalysisResults.estimatedW2Cost,
@@ -341,8 +344,11 @@ type JoinedRequisitionRow = {
   selectedPayRate: string | null;
   payScenario: string | null;
   payEstimateReason: string | null;
+  payRangeConfidence: string | null;
   payRangeFit: string | null;
   marketRateWarning: string | null;
+  marketPayFloor: string | null;
+  billRateSupportsMarketPay: boolean | null;
   roleRiskClassification: string | null;
   effectiveVendorRate: string | null;
   estimatedW2Cost: string | null;
@@ -417,8 +423,11 @@ function mapJoinedRow(row: JoinedRequisitionRow) {
           selectedPayRate: row.selectedPayRate,
           payScenario: row.payScenario,
           payEstimateReason: row.payEstimateReason,
+          payRangeConfidence: row.payRangeConfidence,
           payRangeFit: row.payRangeFit,
           marketRateWarning: row.marketRateWarning,
+          marketPayFloor: row.marketPayFloor,
+          billRateSupportsMarketPay: row.billRateSupportsMarketPay,
           roleRiskClassification: row.roleRiskClassification,
           effectiveVendorRate: row.effectiveVendorRate,
           estimatedW2Cost: row.estimatedW2Cost,

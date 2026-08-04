@@ -21,7 +21,7 @@ const processSchema = z.object({
   ]),
   tenantId: z.string().uuid(),
   mspProgramId: z.string().uuid().optional(),
-  aiProvider: z.enum(["claude"]).default("claude"),
+  aiProvider: z.enum(["grok", "claude"]).default("grok"),
   assumptions: z
     .object({
       ficaPercent: z.number().default(7.65),

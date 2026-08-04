@@ -26,7 +26,6 @@ import { saveUploadFile, loadUploadFile } from "@/lib/file-storage";
 import {
   calculateFinancials,
   calculateScores,
-  calculateW2CostPerHour,
   parseDurationToWeeks,
   assignRanks,
   getRecommendationLabel,
@@ -41,10 +40,16 @@ import {
 } from "@/lib/duplicate-check";
 import {
   buildPayFirstExplanation,
-  derivePayRangeFit,
   parsePayNumber,
   type PayRangeFit,
 } from "@/lib/pay-range";
+import {
+  validatePayRecommendation,
+  dedupeByRequisitionId,
+  normalizeRequisitionId,
+} from "@/lib/pay-validation";
+import { GROK_MODEL } from "@/lib/grok-provider";
+import { GROK_PROMPT_VERSION } from "@/ai/prompts/job-ranking-grok-v1";
 
 type RequisitionAnalysisBatch = typeof requisitionAnalysisBatches.$inferSelect;
 
@@ -139,7 +144,7 @@ export async function uploadSourceFile(input: FileUploadInput): Promise<FileUplo
 export async function processBatchExtraction(
   batchId: string,
   tenantId: string,
-  aiProvider: string = "claude"
+  _aiProvider: string = "grok"
 ): Promise<ExtractionResult> {
   const [existingBatch] = await db
     .select({ status: requisitionAnalysisBatches.status })
@@ -330,9 +335,7 @@ export async function processBatchExtraction(
   const extractedRows: ExtractedRequisition[] = [];
 
   if (imagePayloads.length > 0) {
-    const provider = createRequisitionIntelligenceService(
-      aiProvider === "claude" ? undefined : aiProvider
-    );
+    const provider = createRequisitionIntelligenceService();
 
     const result = await provider.extractRequisitions({
       images: imagePayloads.map((img) => ({
@@ -341,7 +344,7 @@ export async function processBatchExtraction(
         mimeType: img.mimeType,
       })),
       spreadsheets: spreadsheetPayloads,
-      promptVersion: "v1.0",
+      promptVersion: "job-ranking-grok-v1",
     });
 
     for (const job of result.jobs) {
@@ -349,7 +352,7 @@ export async function processBatchExtraction(
       const enriched = {
         ...job,
         source_file_ids: job.source_file_ids?.length ? job.source_file_ids : [fileId],
-        source_record_key: job.source_record_key || `${fileId}:claude:${uuidv4()}`,
+        source_record_key: job.source_record_key || `${fileId}:grok:${uuidv4()}`,
       };
       await db.insert(requisitionSourceRows).values({
         tenantId,
@@ -464,39 +467,13 @@ export async function deduplicateRequisitions(
       )
     );
 
-  const byReqId = new Map<string, ExtractedRequisition[]>();
-  
-  // Group by requisition ID
-  for (const row of rows) {
-    const data = (row.confirmedJson || row.extractedJson) as ExtractedRequisition;
-    const reqId = data.requisition_id;
-    
-    if (reqId) {
-      if (!byReqId.has(reqId)) {
-        byReqId.set(reqId, []);
-      }
-      byReqId.get(reqId)!.push(data);
-    }
-  }
+  const extracted = rows.map(
+    (row) => (row.confirmedJson || row.extractedJson) as ExtractedRequisition
+  );
 
-  const merged: ExtractedRequisition[] = [];
-  
-  // Merge duplicates
-  for (const [reqId, duplicates] of byReqId) {
-    if (duplicates.length === 1) {
-      merged.push(duplicates[0]);
-    } else {
-      const mergedRow = mergeDuplicateRows(duplicates);
-      merged.push(mergedRow);
-    }
-  }
-
-  // Add rows without requisition ID to unresolved
-  const unresolved = rows
-    .filter((row) => !((row.confirmedJson || row.extractedJson) as ExtractedRequisition).requisition_id)
-    .map((row) => (row.confirmedJson || row.extractedJson) as ExtractedRequisition);
-
-  return [...merged, ...unresolved];
+  // Deterministic second pass: normalize IDs, never sum submissions
+  const { unique } = dedupeByRequisitionId(extracted);
+  return unique as ExtractedRequisition[];
 }
 
 /**
@@ -598,7 +575,7 @@ function normalizeCustomerName(name: string | null): string | null {
 }
 
 /**
- * Run Claude pay and fillability analysis on confirmed rows
+ * Run Grok pay and fillability analysis on confirmed rows
  */
 export async function runPayAnalysis(
   batchId: string,
@@ -624,7 +601,7 @@ export async function runPayAnalysis(
     .map((row) => {
       const data = (row.confirmedJson || row.extractedJson) as ExtractedRequisition;
       return {
-        requisition_id: data.requisition_id || "",
+        requisition_id: normalizeRequisitionId(data.requisition_id) || "",
         job_title: data.job_title,
         customer: data.customer,
         location: data.location,
@@ -645,35 +622,63 @@ export async function runPayAnalysis(
     const provider = createRequisitionIntelligenceService();
     const analysis = await provider.estimatePayAndFillability({
       jobs,
-      promptVersion: "v1.0",
+      promptVersion: GROK_PROMPT_VERSION,
     });
 
     const analysisByReqId = new Map(analysis.jobs.map((j) => [j.requisition_id, j]));
 
     for (const row of rows) {
       const data = (row.confirmedJson || row.extractedJson) as ExtractedRequisition;
-      if (!data.requisition_id) continue;
-      const pay = analysisByReqId.get(data.requisition_id);
+      const reqId = normalizeRequisitionId(data.requisition_id);
+      if (!reqId) continue;
+      const pay = analysisByReqId.get(reqId);
       if (!pay) continue;
+
+      const validated = validatePayRecommendation({
+        requisitionId: reqId,
+        recommendedMin: pay.recommended_w2_pay_min,
+        recommendedMax: pay.recommended_w2_pay_max,
+        marketPayFloor: pay.market_pay_floor,
+        marketPayConfidence: pay.market_pay_confidence,
+        payRecommendationReason: pay.pay_recommendation_reason || pay.pay_estimate_reason,
+        billRateSupportsMarketPay: pay.bill_rate_supports_market_pay,
+        billRate: data.c2c_bill_rate,
+        jobTitle: data.job_title,
+        payRangeFit: pay.pay_range_fit,
+        marketRateWarning: pay.market_rate_warning,
+      });
+
+      if (validated.calculationAdjustments.length > 0) {
+        console.info("[pay.validation.adjustments]", {
+          requisition_id: reqId,
+          adjustments: validated.calculationAdjustments,
+        });
+      }
+
+      const qualityNotes = [
+        ...(Array.isArray(data.data_quality_notes) ? data.data_quality_notes : []),
+        ...validated.dataQualityNotes,
+      ];
 
       const enriched = {
         ...data,
-        recommended_w2_pay_min: pay.recommended_w2_pay_min,
-        recommended_w2_pay_max: pay.recommended_w2_pay_max,
-        pay_estimate_reason: pay.pay_estimate_reason,
-        pay_range_confidence: pay.pay_range_confidence,
-        pay_range_fit:
-          pay.pay_range_fit ||
-          derivePayRangeFit({
-            billRate: data.c2c_bill_rate,
-            payMin: pay.recommended_w2_pay_min,
-            payMax: pay.recommended_w2_pay_max,
-          }),
-        market_rate_warning: pay.market_rate_warning,
+        requisition_id: reqId,
+        recommended_w2_pay_min: validated.recommendedMin,
+        recommended_w2_pay_max: validated.recommendedMax,
+        market_pay_floor: validated.marketPayFloor,
+        market_pay_confidence: validated.marketPayConfidence,
+        bill_rate_supports_market_pay: validated.billRateSupportsMarketPay,
+        pay_estimate_reason: validated.payRecommendationReason,
+        pay_recommendation_reason: validated.payRecommendationReason,
+        pay_range_confidence: validated.marketPayConfidence,
+        pay_range_fit: validated.payRangeFit,
+        market_rate_warning: validated.marketRateWarning,
         fillability_score: pay.fillability_score,
         fillability_label: pay.fillability_label,
         fillability_reason: pay.fillability_reason,
         suggested_risk_classification: pay.suggested_risk_classification,
+        data_quality_notes: qualityNotes,
+        requires_pay_review: validated.requiresReview,
       };
 
       await db
@@ -682,29 +687,28 @@ export async function runPayAnalysis(
         .where(eq(requisitionSourceRows.id, row.id));
     }
   } catch (err) {
-    console.error("Pay analysis failed, using bill-rate estimates:", err);
+    console.error("Pay analysis failed; marking rows for review (no bill-rate pay cut):", err);
     for (const row of rows) {
       const data = (row.confirmedJson || row.extractedJson) as ExtractedRequisition;
-      if (!data.requisition_id || !data.c2c_bill_rate) continue;
-      const effectiveRate = data.c2c_bill_rate * 0.98;
-      const payMid = Math.round(effectiveRate * 0.55);
-      const payMin = payMid - 1;
-      const payMax = payMid + 1;
+      if (!data.requisition_id) continue;
       const enriched = {
         ...data,
-        recommended_w2_pay_min: payMin,
-        recommended_w2_pay_max: payMax,
+        recommended_w2_pay_min: null,
+        recommended_w2_pay_max: null,
+        market_pay_floor: null,
+        bill_rate_supports_market_pay: null,
         pay_estimate_reason:
-          "Estimated from bill rate (Claude unavailable). Leading with candidate pay viability.",
+          "Grok pay analysis unavailable. Requires manual market pay review — pay was not lowered from bill rate.",
         pay_range_confidence: "Low" as const,
-        pay_range_fit: derivePayRangeFit({
-          billRate: data.c2c_bill_rate,
-          payMin,
-          payMax,
-          analysisFailed: true,
-        }),
-        fillability_score: 70,
-        fillability_label: "Moderate" as const,
+        pay_range_fit: "Requires Review" as const,
+        market_rate_warning: "Pay analysis failed; do not recruit until pay is reviewed",
+        fillability_score: 50,
+        fillability_label: "Difficult" as const,
+        requires_pay_review: true,
+        data_quality_notes: [
+          ...(Array.isArray(data.data_quality_notes) ? data.data_quality_notes : []),
+          "Grok pay analysis failed; record flagged for manual review.",
+        ],
       };
       await db
         .update(requisitionSourceRows)
@@ -1004,7 +1008,7 @@ export async function finalizeBatch(
   let existingRecordsUpdated = 0;
   let unchangedExistingRecords = 0;
   let analysisRecordsCreated = 0;
-  let analysisRecordsReused = 0;
+  const analysisRecordsReused = 0;
 
   const includedSourceRows = await db
     .select({ count: sql<number>`count(*)::int` })
@@ -1025,35 +1029,55 @@ export async function finalizeBatch(
     const analyzedRow = row as ExtractedRequisition & {
       recommended_w2_pay_min?: number | null;
       recommended_w2_pay_max?: number | null;
+      market_pay_floor?: number | null;
+      market_pay_confidence?: "High" | "Medium" | "Low" | null;
+      bill_rate_supports_market_pay?: boolean | null;
       fillability_score?: number | null;
       pay_estimate_reason?: string | null;
+      pay_recommendation_reason?: string | null;
       market_rate_warning?: string | null;
       pay_range_fit?: PayRangeFit | null;
       pay_range_confidence?: "High" | "Medium" | "Low" | null;
       fillability_reason?: string | null;
+      requires_pay_review?: boolean;
     };
 
-    // Calculate pay midpoint
-    const payMin = analyzedRow.recommended_w2_pay_min || 0;
-    const payMax = analyzedRow.recommended_w2_pay_max || 0;
-    const payMidpoint = (payMin + payMax) / 2;
-    const payRangeFit: PayRangeFit =
-      analyzedRow.pay_range_fit ||
-      derivePayRangeFit({
-        billRate: parsePayNumber(row.c2c_bill_rate),
-        payMin: payMin || null,
-        payMax: payMax || null,
-        missingRequired: !row.c2c_bill_rate || !payMin || !payMax,
+    const payValidated = validatePayRecommendation({
+      requisitionId: row.requisition_id,
+      recommendedMin: analyzedRow.recommended_w2_pay_min ?? null,
+      recommendedMax: analyzedRow.recommended_w2_pay_max ?? null,
+      marketPayFloor: analyzedRow.market_pay_floor,
+      marketPayConfidence:
+        analyzedRow.market_pay_confidence || analyzedRow.pay_range_confidence,
+      payRecommendationReason:
+        analyzedRow.pay_recommendation_reason || analyzedRow.pay_estimate_reason,
+      billRateSupportsMarketPay: analyzedRow.bill_rate_supports_market_pay,
+      billRate: parsePayNumber(row.c2c_bill_rate),
+      jobTitle: row.job_title,
+      payRangeFit: analyzedRow.pay_range_fit,
+      marketRateWarning: analyzedRow.market_rate_warning,
+    });
+
+    if (payValidated.calculationAdjustments.length > 0) {
+      console.info("[finalize.pay.adjustments]", {
+        requisition_id: row.requisition_id,
+        adjustments: payValidated.calculationAdjustments,
       });
+    }
+
+    const payMin = payValidated.recommendedMin || 0;
+    const payMax = payValidated.recommendedMax || 0;
+    const payMidpoint = payValidated.midpoint ?? (payMin + payMax) / 2;
+    const payRangeFit = payValidated.payRangeFit;
     const payEstimateReason =
-      analyzedRow.pay_estimate_reason ||
+      payValidated.payRecommendationReason ||
       buildPayFirstExplanation({
         payMin: payMin || null,
         payMax: payMax || null,
         payRangeFit,
         fillabilityLabel: getFillabilityLabel(analyzedRow.fillability_score || 50),
         submissionCount: row.submissions,
-        marketRateWarning: analyzedRow.market_rate_warning,
+        marketRateWarning: payValidated.marketRateWarning,
       });
 
     // Parse duration
@@ -1148,7 +1172,13 @@ export async function finalizeBatch(
       const titleChanged = (row.job_title || null) !== existingReq.jobTitle;
       const submissionsChanged =
         (row.submissions ?? null) !== (existingReq.submissionCount ?? null);
-      const changed = billChanged || titleChanged || submissionsChanged;
+      const statusChanged = (row.status || null) !== (existingReq.status || null);
+      const changed = billChanged || titleChanged || submissionsChanged || statusChanged;
+
+      const prevSubs = existingReq.submissionCount ?? null;
+      const newSubs = row.submissions ?? null;
+      const submissionCountChange =
+        prevSubs != null && newSubs != null ? newSubs - prevSubs : null;
 
       await db
         .update(requisitions)
@@ -1169,10 +1199,20 @@ export async function finalizeBatch(
           positionType: row.position_type,
           remoteOrOnsite: row.remote_or_onsite || "Unknown",
           sourceConfidence: row.source_confidence,
-          dataQualityNotes: row.data_quality_notes || [],
+          dataQualityNotes: [
+            ...(row.data_quality_notes || []),
+            ...payValidated.dataQualityNotes,
+          ],
           lastSeenAt: now,
           lastAnalyzedAt: now,
           isNewToday: false,
+          isNoLongerVisible: false,
+          previousSubmissionCount: prevSubs,
+          submissionCountChange,
+          previousStatus: existingReq.status,
+          statusChange: statusChanged
+            ? `${existingReq.status || "null"} → ${row.status || "null"}`
+            : existingReq.statusChange,
           updatedAt: now,
         })
         .where(eq(requisitions.id, existingReq.id));
@@ -1279,7 +1319,25 @@ export async function finalizeBatch(
 
     if (reqRecord) {
       // Upsert analysis result
-      const recommendation = getRecommendationLabel(scores.opportunityScore);
+      let recommendation = getRecommendationLabel(scores.opportunityScore);
+      const negativeProfit = financials.estimatedProfitPerHour.lte(0);
+      const billUnsupported = payValidated.billRateSupportsMarketPay === false;
+
+      // High opportunity score must not hide negative operating margin / inadequate bill
+      if (negativeProfit || billUnsupported) {
+        if (
+          recommendation === "Recruit Immediately" ||
+          recommendation === "High Priority" ||
+          recommendation === "Good Opportunity"
+        ) {
+          recommendation = "Candidate Driven";
+        }
+      }
+
+      const requiresManualReview =
+        requiresHealthcareReview ||
+        payValidated.requiresReview ||
+        analyzedRow.requires_pay_review === true;
       
       await db
         .insert(requisitionAnalysisResults)
@@ -1294,9 +1352,11 @@ export async function finalizeBatch(
           selectedPayRate: payMidpoint.toString(),
           payScenario: "midpoint",
           payEstimateReason: payEstimateReason,
-          payRangeConfidence: analyzedRow.pay_range_confidence || "Medium",
+          payRangeConfidence: payValidated.marketPayConfidence || "Medium",
           payRangeFit,
-          marketRateWarning: analyzedRow.market_rate_warning || null,
+          marketRateWarning: payValidated.marketRateWarning || null,
+          marketPayFloor: payValidated.marketPayFloor?.toString() || null,
+          billRateSupportsMarketPay: payValidated.billRateSupportsMarketPay,
           roleRiskClassification: roleRisk,
           effectiveVendorRate: financials.effectiveVendorRate.toString(),
           estimatedW2Cost: financials.w2CostPerHour.toString(),
@@ -1315,7 +1375,9 @@ export async function finalizeBatch(
           rank: 0, // Will be updated after all calculations
           calculatedRecommendation: recommendation,
           finalRecommendation: recommendation,
-          requiresManualReview: requiresHealthcareReview,
+          requiresManualReview,
+          claudeModel: GROK_MODEL,
+          promptVersion: GROK_PROMPT_VERSION,
         })
         .onConflictDoUpdate({
           target: [requisitionAnalysisResults.requisitionId],
@@ -1326,9 +1388,11 @@ export async function finalizeBatch(
             payMidpoint: payMidpoint.toString(),
             selectedPayRate: payMidpoint.toString(),
             payEstimateReason: payEstimateReason,
-            payRangeConfidence: analyzedRow.pay_range_confidence || "Medium",
+            payRangeConfidence: payValidated.marketPayConfidence || "Medium",
             payRangeFit,
-            marketRateWarning: analyzedRow.market_rate_warning || null,
+            marketRateWarning: payValidated.marketRateWarning || null,
+            marketPayFloor: payValidated.marketPayFloor?.toString() || null,
+            billRateSupportsMarketPay: payValidated.billRateSupportsMarketPay,
             roleRiskClassification: roleRisk,
             effectiveVendorRate: financials.effectiveVendorRate.toString(),
             estimatedW2Cost: financials.w2CostPerHour.toString(),
@@ -1346,7 +1410,9 @@ export async function finalizeBatch(
             opportunityScore: scores.opportunityScore,
             calculatedRecommendation: recommendation,
             finalRecommendation: recommendation,
-            requiresManualReview: requiresHealthcareReview,
+            requiresManualReview,
+            claudeModel: GROK_MODEL,
+            promptVersion: GROK_PROMPT_VERSION,
             updatedAt: new Date(),
           },
         });
@@ -1365,9 +1431,11 @@ export async function finalizeBatch(
         selectedPayRate: payMidpoint.toString(),
         payScenario: "midpoint",
         payEstimateReason: payEstimateReason,
-        payRangeConfidence: analyzedRow.pay_range_confidence || "Medium",
+        payRangeConfidence: payValidated.marketPayConfidence || "Medium",
         payRangeFit,
-        marketRateWarning: analyzedRow.market_rate_warning || null,
+        marketRateWarning: payValidated.marketRateWarning || null,
+        marketPayFloor: payValidated.marketPayFloor?.toString() || null,
+        billRateSupportsMarketPay: payValidated.billRateSupportsMarketPay,
         roleRiskClassification: roleRisk,
         effectiveVendorRate: financials.effectiveVendorRate.toString(),
         estimatedW2Cost: financials.w2CostPerHour.toString(),
@@ -1396,9 +1464,27 @@ export async function finalizeBatch(
         durationWeeks,
         effectiveVendorRate: financials.effectiveVendorRate.toNumber(),
         releasedDate: row.released_date ? new Date(row.released_date) : null,
-        requiresManualReview: requiresHealthcareReview,
+        requiresManualReview,
       });
     }
+  }
+
+  // Mark requisitions not present in this import as no longer visible (current context only)
+  const seenIds = results.map((r) => r.requisitionId);
+  if (seenIds.length > 0) {
+    await db
+      .update(requisitions)
+      .set({ isNoLongerVisible: true, updatedAt: new Date() })
+      .where(
+        and(
+          eq(requisitions.tenantId, tenantId),
+          eq(requisitions.mspProgramId, mspProgramId),
+          sql`${requisitions.requisitionId} NOT IN (${sql.join(
+            seenIds.map((id) => sql`${id}`),
+            sql`, `
+          )})`
+        )
+      );
   }
 
   // Assign ranks

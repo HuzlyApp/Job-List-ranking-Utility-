@@ -72,7 +72,7 @@ export function formatPayRate(
 }
 
 /**
- * Deterministic Pay Range Fit when Claude does not provide one.
+ * Deterministic Pay Range Fit when Grok does not provide one.
  * Uses bill-rate headroom vs midpoint of recommended pay.
  */
 export function derivePayRangeFit(input: {

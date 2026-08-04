@@ -22,6 +22,20 @@
       "when": 1785435300000,
       "tag": "0002_check_constraints",
       "breakpoints": true
+    },
+    {
+      "idx": 3,
+      "version": "7",
+      "when": 1785435400000,
+      "tag": "0003_pay_range_and_duplicates",
+      "breakpoints": true
+    },
+    {
+      "idx": 4,
+      "version": "7",
+      "when": 1785435500000,
+      "tag": "0004_grok_market_pay_fields",
+      "breakpoints": true
     }
   ]
 }

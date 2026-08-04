@@ -20,7 +20,8 @@ This system helps recruiters determine which requisitions to pursue before spend
 - **Styling**: Tailwind CSS
 - **Database**: Neon Postgres
 - **ORM**: Drizzle ORM
-- **AI**: Claude (Anthropic) via abstraction layer
+- **AI**: xAI Grok (OpenAI-compatible API) via centralized server-side provider
+- Financial calculations, ranking, and Excel generation remain deterministic on the server
 - **File Parsing**: xlsx (Excel), exceljs (Export)
 - **Validation**: Zod
 
@@ -29,7 +30,7 @@ This system helps recruiters determine which requisitions to pursue before spend
 ### Core Functionality
 
 - **Multi-format Upload**: Support for PNG, JPG, JPEG, WEBP images and XLSX, XLS, CSV spreadsheets
-- **AI-Powered Extraction**: Claude AI extracts requisition data from screenshots
+- **AI-Powered Extraction**: Grok extracts requisition data from screenshots; spreadsheets parse locally
 - **Smart Deduplication**: Merges duplicate requisitions by Requisition ID
 - **Financial Calculations**: Deterministic calculations for profit, margin, and costs
 - **Scoring System**: Weighted opportunity scores based on competition, profitability, fillability, bill rate, and duration
@@ -104,8 +105,12 @@ Calculates:
 # Database
 DATABASE_URL=postgresql://user:pass@host/db?sslmode=require
 
-# AI Provider
-CLAUDE_API_KEY=sk-ant-...
+# AI Provider (xAI Grok — server-side only)
+XAI_API_KEY=xai-...
+GROK_BASE_URL=https://api.x.ai/v1
+GROK_MODEL=grok-2-vision-1212
+GROK_TIMEOUT_MS=120000
+GROK_MAX_RETRIES=2
 
 # Neon (for MCP)
 NEON_API_KEY=napi_...
@@ -249,7 +254,7 @@ All financial calculations are performed in application code, not by AI. This en
 
 ## Known Limitations
 
-- Image OCR requires Claude API credits
+- Image OCR requires a vision-capable Grok model (`GROK_MODEL`) and xAI API credits
 - Large batches may take time to process
 - Healthcare workers comp requires manual configuration
 - Some edge cases in duration parsing

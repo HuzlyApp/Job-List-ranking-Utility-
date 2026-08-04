@@ -96,7 +96,7 @@ export async function POST(
         });
       }
     } else {
-      // Screenshots may need Claude — continue after the response is sent.
+      // Screenshots may need Grok vision — continue after the response is sent.
       after(async () => {
         try {
           await processBatchExtraction(batchId, meta.tenantId);

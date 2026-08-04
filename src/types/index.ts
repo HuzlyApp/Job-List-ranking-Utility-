@@ -53,9 +53,14 @@ export const ClaudePayAnalysisItemSchema = z.object({
   // Preferred field names (pay-range first)
   recommended_pay_min: z.number().nonnegative().nullable().optional(),
   recommended_pay_max: z.number().nonnegative().nullable().optional(),
-  // Backward-compatible aliases
+  // Canonical / Grok field names
   recommended_w2_pay_min: z.number().nonnegative().nullable().optional(),
   recommended_w2_pay_max: z.number().nonnegative().nullable().optional(),
+
+  market_pay_floor: z.number().nonnegative().nullable().optional(),
+  market_pay_confidence: z.enum(["High", "Medium", "Low"]).optional(),
+  pay_recommendation_reason: z.string().min(1).optional(),
+  bill_rate_supports_market_pay: z.boolean().nullable().optional(),
 
   pay_range_confidence: z.enum(["High", "Medium", "Low"]).optional().default("Medium"),
   pay_range_reason: z.string().min(1).optional(),
@@ -96,9 +101,12 @@ export const ClaudePayAnalysisItemSchema = z.object({
   const recommended_w2_pay_max =
     item.recommended_pay_max ?? item.recommended_w2_pay_max ?? null;
   const pay_estimate_reason =
+    item.pay_recommendation_reason ||
     item.pay_range_reason ||
     item.pay_estimate_reason ||
     "Pay range estimated from role and market context";
+  const market_pay_confidence =
+    item.market_pay_confidence || item.pay_range_confidence || "Medium";
 
   return {
     requisition_id: item.requisition_id,
@@ -106,7 +114,11 @@ export const ClaudePayAnalysisItemSchema = z.object({
     recommended_w2_pay_max,
     recommended_pay_min: recommended_w2_pay_min,
     recommended_pay_max: recommended_w2_pay_max,
-    pay_range_confidence: item.pay_range_confidence || "Medium",
+    market_pay_floor: item.market_pay_floor ?? null,
+    market_pay_confidence,
+    pay_recommendation_reason: pay_estimate_reason,
+    bill_rate_supports_market_pay: item.bill_rate_supports_market_pay ?? null,
+    pay_range_confidence: market_pay_confidence,
     pay_estimate_reason,
     pay_range_reason: pay_estimate_reason,
     pay_range_fit: item.pay_range_fit,
@@ -125,6 +137,12 @@ export const ClaudePayAnalysisSchema = z.object({
 });
 
 export type ClaudePayAnalysisOutput = z.infer<typeof ClaudePayAnalysisSchema>;
+
+/** Provider-neutral aliases (Claude* names kept for backward compatibility) */
+export const GrokExtractionSchema = ClaudeExtractionSchema;
+export type GrokExtractionOutput = ClaudeExtractionOutput;
+export const GrokPayAnalysisSchema = ClaudePayAnalysisSchema;
+export type GrokPayAnalysisOutput = ClaudePayAnalysisOutput;
 
 // =============================================================================
 // Legacy combined schemas (for backward compatibility during refactor)

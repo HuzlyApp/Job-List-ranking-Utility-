@@ -294,11 +294,11 @@ export function DetailDrawer({ requisition, onClose, isOpen }: DetailDrawerProps
             </div>
           )}
 
-          {/* Claude Analysis */}
+          {/* Grok Analysis */}
           {analysis && (
             <div className="px-6 py-5">
               <h3 className="text-sm font-semibold text-slate-900 uppercase tracking-wider mb-4">
-                Claude Analysis
+                AI Analysis
               </h3>
               <div className="space-y-4 text-sm">
                 <div>

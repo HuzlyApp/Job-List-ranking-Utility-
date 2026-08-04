@@ -270,6 +270,12 @@ export const requisitions = pgTable("requisitions", {
   isNewToday: boolean("is_new_today").notNull().default(true),
   isNoLongerVisible: boolean("is_no_longer_visible").notNull().default(false),
 
+  // Historical change tracking
+  previousSubmissionCount: integer("previous_submission_count"),
+  submissionCountChange: integer("submission_count_change"),
+  previousStatus: varchar("previous_status", { length: 100 }),
+  statusChange: varchar("status_change", { length: 100 }),
+
   // Workflow
   recruiterOwnerId: uuid("recruiter_owner_id").references(() => users.id),
   recruitingStatus: recruitingStatusEnum("recruiting_status").notNull().default("Not Reviewed"),
@@ -316,6 +322,8 @@ export const requisitionSnapshots = pgTable("requisition_snapshots", {
   payRangeFit: payRangeFitEnum("pay_range_fit"),
   payOverrideReason: text("pay_override_reason"),
   marketRateWarning: text("market_rate_warning"),
+  marketPayFloor: decimal("market_pay_floor", { precision: 10, scale: 2 }),
+  billRateSupportsMarketPay: boolean("bill_rate_supports_market_pay"),
 
   // Financial snapshot
   roleRiskClassification: roleRiskEnum("role_risk_classification").default("Standard"),
@@ -367,6 +375,8 @@ export const requisitionAnalysisResults = pgTable("requisition_analysis_results"
   payRangeFit: payRangeFitEnum("pay_range_fit"),
   payOverrideReason: text("pay_override_reason"),
   marketRateWarning: text("market_rate_warning"),
+  marketPayFloor: decimal("market_pay_floor", { precision: 10, scale: 2 }),
+  billRateSupportsMarketPay: boolean("bill_rate_supports_market_pay"),
 
   // Financials
   roleRiskClassification: roleRiskEnum("role_risk_classification").default("Standard"),
@@ -393,7 +403,7 @@ export const requisitionAnalysisResults = pgTable("requisition_analysis_results"
   finalRecommendation: recommendationEnum("final_recommendation"),
   requiresManualReview: boolean("requires_manual_review").notNull().default(false),
 
-  // Metadata
+  // Metadata — claude_model column retained; stores active AI model name (Grok)
   claudeModel: varchar("claude_model", { length: 100 }),
   promptVersion: varchar("prompt_version", { length: 50 }),
   calculatedAt: timestamp("calculated_at", { withTimezone: true }).defaultNow().notNull(),
