@@ -10,8 +10,15 @@ import {
   runPayAnalysis,
   markBatchFailed,
 } from "@/lib/extraction-service";
+import { sanitizeDbError, withDbRetry } from "@/db";
 
 export const maxDuration = 300;
+
+const MUTATING_ACTIONS = new Set([
+  "extract",
+  "finalize",
+  "pay_analysis",
+]);
 
 const processSchema = z.object({
   action: z.enum([
@@ -59,10 +66,12 @@ export async function POST(
   { params }: { params: Promise<{ id: string }> }
 ) {
   let batchId = "";
+  let action: string | undefined;
   try {
     ({ id: batchId } = await params);
     const body = await request.json();
     const validated = processSchema.parse(body);
+    action = validated.action;
 
     if (validated.action === "extract") {
       const result = await processBatchExtraction(
@@ -74,12 +83,18 @@ export async function POST(
     }
 
     if (validated.action === "get_status") {
-      const status = await getBatchStatus(batchId, validated.tenantId);
+      const status = await withDbRetry(
+        () => getBatchStatus(batchId, validated.tenantId),
+        { label: "get_status" }
+      );
       return NextResponse.json({ status });
     }
 
     if (validated.action === "get_review") {
-      const review = await getReviewRows(batchId, validated.tenantId);
+      const review = await withDbRetry(
+        () => getReviewRows(batchId, validated.tenantId),
+        { label: "get_review" }
+      );
       return NextResponse.json(review);
     }
 
@@ -129,29 +144,30 @@ export async function POST(
     return NextResponse.json({ error: "Invalid action" }, { status: 400 });
   } catch (error) {
     console.error("Error processing batch:", error);
-    if (batchId) {
-      const message =
-        error instanceof Error ? error.message : "Failed to process batch";
+    const safeMessage = sanitizeDbError(error);
+
+    // Never mark the batch failed for read-only polling — that permanently
+    // stuck imports after transient Neon blips during get_status.
+    if (batchId && action && MUTATING_ACTIONS.has(action)) {
       try {
-        await markBatchFailed(batchId, "PROCESSING_ERROR", message.slice(0, 500));
+        await markBatchFailed(batchId, "PROCESSING_ERROR", safeMessage);
       } catch (markErr) {
         console.error("Failed to mark batch failed:", markErr);
       }
     }
+
     if (error instanceof z.ZodError) {
       return NextResponse.json({ error: error.issues }, { status: 400 });
     }
-    const message =
-      error instanceof Error ? error.message : "Failed to process batch";
     const statusCode =
       error instanceof Error &&
       "statusCode" in error &&
       typeof (error as { statusCode?: unknown }).statusCode === "number"
         ? (error as { statusCode: number }).statusCode
-        : message === "Batch not found" || message === "Row not found"
+        : safeMessage === "Batch not found" || safeMessage === "Row not found"
           ? 404
           : 500;
-    return NextResponse.json({ error: message }, { status: statusCode });
+    return NextResponse.json({ error: safeMessage }, { status: statusCode });
   }
 }
 
@@ -169,10 +185,15 @@ export async function PATCH(
       return NextResponse.json({ error: "rowId and tenantId required" }, { status: 400 });
     }
 
-    await updateSourceRow(rowId, tenantId, updates);
+    await withDbRetry(() => updateSourceRow(rowId, tenantId, updates), {
+      label: "update_source_row",
+    });
     return NextResponse.json({ success: true });
   } catch (error) {
     console.error("Error updating row:", error);
-    return NextResponse.json({ error: "Failed to update row" }, { status: 500 });
+    return NextResponse.json(
+      { error: sanitizeDbError(error) },
+      { status: 500 }
+    );
   }
 }

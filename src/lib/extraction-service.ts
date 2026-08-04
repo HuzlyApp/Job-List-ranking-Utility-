@@ -1,4 +1,4 @@
-import { db } from "@/db";
+import { db, sanitizeDbError } from "@/db";
 import {
   requisitionAnalysisBatches,
   requisitionSourceFiles,
@@ -1656,12 +1656,17 @@ export async function markBatchFailed(
   errorCode: string,
   message: string
 ): Promise<void> {
+  const safe =
+    /Failed query/i.test(message) || message.length > 200
+      ? sanitizeDbError(new Error(message))
+      : message.slice(0, 500);
+
   await db
     .update(requisitionAnalysisBatches)
     .set({
       status: "failed",
       errorCode,
-      sanitizedErrorMessage: message.slice(0, 500),
+      sanitizedErrorMessage: safe,
       completedAt: new Date(),
       updatedAt: new Date(),
     })
