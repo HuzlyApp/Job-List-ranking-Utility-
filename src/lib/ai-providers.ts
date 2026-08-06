@@ -10,7 +10,6 @@ import {
   assertGrokSupportsImages,
   getGrokClient,
   getGrokConfigMeta,
-  GROK_MODEL,
 } from "@/lib/grok-provider";
 import {
   GROK_EXTRACTION_SYSTEM_PROMPT,
@@ -18,17 +17,26 @@ import {
   GROK_PROMPT_VERSION,
 } from "@/ai/prompts/job-ranking-grok-v1";
 import { normalizeGrokPayAnalysisPayload } from "@/lib/pay-normalization";
+import {
+  getAnalysisRuntimeConfig,
+  type AnalysisRuntimeConfig,
+} from "@/lib/analysis-config";
+import {
+  computeBackoffMs,
+  mapWithConcurrencySettled,
+  sleep,
+} from "@/lib/concurrency";
+import {
+  buildPerfSummary,
+  computeProgressPercent,
+  estimateCompletionIso,
+  mergeProgress,
+  stageLabel,
+  type AnalysisPerfCounters,
+  type AnalysisProgressSnapshot,
+} from "@/lib/analysis-progress";
 
-/** Max jobs per Grok pay-analysis request to avoid truncation / timeouts. */
-const PAY_ANALYSIS_CHUNK_SIZE = 8;
-
-export type PayAnalysisProgress = {
-  analyzed: number;
-  total: number;
-  currentChunk: number;
-  totalChunks: number;
-  stage: "analyzing_grok" | "validating" | "complete" | "failed";
-};
+export type PayAnalysisProgress = AnalysisProgressSnapshot;
 
 export interface PayAndFillabilityInput {
   jobs: Array<{
@@ -43,8 +51,22 @@ export interface PayAndFillabilityInput {
     submissions: number | null;
   }>;
   promptVersion: string;
+  batchId?: string;
   onProgress?: (progress: PayAnalysisProgress) => void | Promise<void>;
-};
+  /** Persist each completed chunk immediately (successful + failed terminal rows). */
+  onChunkComplete?: (event: {
+    chunkIndex: number;
+    totalChunks: number;
+    jobs: ClaudePayAnalysisOutput["jobs"];
+    failedRequisitionIds: string[];
+    model: string;
+    requestId: string | null;
+    modelLatencyMs: number;
+    parseLatencyMs: number;
+    inputTokens: number;
+    outputTokens: number;
+  }) => void | Promise<void>;
+}
 
 export interface RequisitionExtractionInput {
   images?: Array<{
@@ -82,6 +104,30 @@ export type GrokCallMeta = {
   correlationId?: string;
 };
 
+type ChunkWork = {
+  chunkIndex: number;
+  jobs: PayAndFillabilityInput["jobs"];
+};
+
+function isRetryableGrokError(message: string): boolean {
+  return /429|rate.?limit|timeout|ETIMEDOUT|AbortError|503|502|504|overloaded|temporar/i.test(
+    message
+  );
+}
+
+function extractRetryAfterSeconds(err: unknown): number | null {
+  if (!err || typeof err !== "object") return null;
+  const headers = (err as { headers?: { get?: (k: string) => string | null } })
+    .headers;
+  const raw =
+    headers?.get?.("retry-after") ||
+    (err as { response?: { headers?: Record<string, string> } }).response
+      ?.headers?.["retry-after"];
+  if (!raw) return null;
+  const n = Number(raw);
+  return Number.isFinite(n) ? n : null;
+}
+
 // ------------------------------------------------------------------------------
 // Grok Implementation (xAI OpenAI-compatible API)
 // ------------------------------------------------------------------------------
@@ -89,9 +135,11 @@ export type GrokCallMeta = {
 export class GrokRequisitionService implements RequisitionIntelligenceService {
   private model: string;
   private promptVersion: string;
+  private config: AnalysisRuntimeConfig;
 
   constructor(model?: string) {
-    this.model = model || GROK_MODEL;
+    this.config = getAnalysisRuntimeConfig();
+    this.model = model || this.config.model;
     this.promptVersion = GROK_PROMPT_VERSION;
   }
 
@@ -128,86 +176,413 @@ export class GrokRequisitionService implements RequisitionIntelligenceService {
       return { jobs: [] };
     }
 
+    const batchId = input.batchId || "unknown";
+    const chunkSize = this.config.chunkSize;
+    const concurrency = this.config.concurrency;
     const total = input.jobs.length;
-    const totalChunks = Math.max(1, Math.ceil(total / PAY_ANALYSIS_CHUNK_SIZE));
+    const chunks: ChunkWork[] = [];
+    for (let i = 0; i < total; i += chunkSize) {
+      chunks.push({
+        chunkIndex: chunks.length,
+        jobs: input.jobs.slice(i, i + chunkSize),
+      });
+    }
+    const totalChunks = chunks.length;
+    const startedAt = new Date().toISOString();
+    const batchStarted = Date.now();
+
+    console.info("[analysis.batch.start]", {
+      batchId,
+      model: this.model,
+      mode: this.config.mode,
+      chunkSize,
+      concurrency,
+      totalRows: total,
+      totalChunks,
+      maxOutputTokens: this.config.maxOutputTokens,
+      promptVersion: input.promptVersion || this.promptVersion,
+    });
+
+    let processedRows = 0;
+    let successfulRows = 0;
+    let failedRows = 0;
+    let completedChunks = 0;
+    let progressSnapshot = mergeProgress(null, {
+      stage: "analyzing_grok",
+      totalRows: total,
+      processedRows: 0,
+      successfulRows: 0,
+      failedRows: 0,
+      totalChunks,
+      completedChunks: 0,
+      currentChunk: 0,
+      selectedModel: this.model,
+      startedAt,
+      lastActivityAt: startedAt,
+      progressPercent: 0,
+    });
+
+    /** Serialize progress mutations across concurrent chunk workers */
+    let progressGate: Promise<void> = Promise.resolve();
+    const withProgressLock = async <T>(fn: () => Promise<T>): Promise<T> => {
+      const previous = progressGate;
+      let release!: () => void;
+      progressGate = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      await previous;
+      try {
+        return await fn();
+      } finally {
+        release();
+      }
+    };
+
+    const emitProgress = async (
+      patch: Partial<AnalysisProgressSnapshot>
+    ) => {
+      await withProgressLock(async () => {
+        progressSnapshot = mergeProgress(progressSnapshot, {
+          ...patch,
+          lastActivityAt: new Date().toISOString(),
+          estimatedCompletionAt: estimateCompletionIso(
+            startedAt,
+            patch.processedRows ?? progressSnapshot.processedRows,
+            total
+          ),
+        });
+        await input.onProgress?.(progressSnapshot);
+        console.info("[analysis.progress]", {
+          batchId,
+          ...progressSnapshot,
+          totalElapsedMs: Date.now() - batchStarted,
+        });
+      });
+    };
+
+    await emitProgress({ stage: "analyzing_grok" });
+
+    const counters: AnalysisPerfCounters = {
+      promptBuildMsTotal: 0,
+      modelLatencyMsTotal: 0,
+      modelLatencyMsMax: 0,
+      parseLatencyMsTotal: 0,
+      databaseLatencyMsTotal: 0,
+      inputTokensTotal: 0,
+      outputTokensTotal: 0,
+      modelRequestCount: 0,
+      retryCount: 0,
+      sequential: concurrency <= 1,
+      concurrency,
+      chunkSize,
+    };
+
     const allJobs: ClaudePayAnalysisOutput["jobs"] = [];
-    let analyzed = 0;
-    let failedChunks = 0;
     const chunkErrors: string[] = [];
 
-    for (let chunkIndex = 0; chunkIndex < totalChunks; chunkIndex++) {
-      const start = chunkIndex * PAY_ANALYSIS_CHUNK_SIZE;
-      const chunk = input.jobs.slice(start, start + PAY_ANALYSIS_CHUNK_SIZE);
-
-      await input.onProgress?.({
-        analyzed,
-        total,
-        currentChunk: chunkIndex + 1,
-        totalChunks,
-        stage: "analyzing_grok",
-      });
-
-      try {
-        const partial = await this.estimatePayChunk(chunk, input.promptVersion);
-        allJobs.push(...partial.jobs);
-        analyzed = Math.min(total, analyzed + partial.jobs.length);
-      } catch (err) {
-        failedChunks += 1;
-        const message = err instanceof Error ? err.message : "Grok chunk failed";
-        chunkErrors.push(`chunk ${chunkIndex + 1}: ${message}`);
-        console.error("[grok.pay.chunk.failed]", {
-          chunk: chunkIndex + 1,
+    const settled = await mapWithConcurrencySettled(
+      chunks,
+      concurrency,
+      async (chunk) => {
+        const chunkStart = Date.now();
+        console.info("[analysis.chunk.start]", {
+          batchId,
+          chunkIndex: chunk.chunkIndex + 1,
           totalChunks,
-          jobCount: chunk.length,
+          rowCount: chunk.jobs.length,
+          model: this.model,
+        });
+
+        await emitProgress({
+          stage: "analyzing_grok",
+          currentChunk: chunk.chunkIndex + 1,
+          currentStage: `Evaluating chunk ${chunk.chunkIndex + 1} of ${totalChunks}`,
+        });
+
+        const result = await this.estimatePayChunkWithRetry(
+          chunk.jobs,
+          input.promptVersion,
+          counters,
+          batchId,
+          chunk.chunkIndex
+        );
+
+        const returnedIds = new Set(
+          result.jobs.map((j) => j.requisition_id)
+        );
+        const failedRequisitionIds = chunk.jobs
+          .map((j) => j.requisition_id)
+          .filter((id) => !returnedIds.has(id));
+
+        const dbStarted = Date.now();
+        if (input.onChunkComplete) {
+          await input.onChunkComplete({
+            chunkIndex: chunk.chunkIndex,
+            totalChunks,
+            jobs: result.jobs,
+            failedRequisitionIds,
+            model: this.model,
+            requestId: result.requestId,
+            modelLatencyMs: result.modelLatencyMs,
+            parseLatencyMs: result.parseLatencyMs,
+            inputTokens: result.inputTokens,
+            outputTokens: result.outputTokens,
+          });
+        }
+        const databaseLatencyMs = Date.now() - dbStarted;
+        counters.databaseLatencyMsTotal += databaseLatencyMs;
+
+        await withProgressLock(async () => {
+          successfulRows += result.jobs.length;
+          failedRows += failedRequisitionIds.length;
+          processedRows = successfulRows + failedRows;
+          completedChunks += 1;
+        });
+
+        await emitProgress({
+          stage:
+            completedChunks >= totalChunks ? "complete" : "analyzing_grok",
+          processedRows,
+          successfulRows,
+          failedRows,
+          completedChunks,
+          currentChunk: chunk.chunkIndex + 1,
+          progressPercent: computeProgressPercent(processedRows, total),
+          currentStage:
+            completedChunks >= totalChunks
+              ? stageLabel("complete")
+              : `Evaluated ${processedRows} of ${total} requisitions`,
+        });
+
+        console.info("[analysis.chunk.complete]", {
+          batchId,
+          chunkIndex: chunk.chunkIndex + 1,
+          totalChunks,
+          rowCount: chunk.jobs.length,
+          successfulRows: result.jobs.length,
+          failedRows: failedRequisitionIds.length,
+          model: this.model,
+          inputTokens: result.inputTokens,
+          outputTokens: result.outputTokens,
+          modelLatencyMs: result.modelLatencyMs,
+          parseLatencyMs: result.parseLatencyMs,
+          databaseLatencyMs,
+          totalElapsedMs: Date.now() - chunkStart,
+          requestId: result.requestId,
+        });
+
+        return result.jobs;
+      }
+    );
+
+    for (const item of settled) {
+      if (item.ok) {
+        allJobs.push(...item.value);
+      } else {
+        const message =
+          item.error instanceof Error
+            ? item.error.message
+            : "Grok chunk failed";
+        chunkErrors.push(`chunk ${item.index + 1}: ${message}`);
+        const failedIds = chunks[item.index].jobs.map((j) => j.requisition_id);
+        failedRows += failedIds.length;
+        processedRows = successfulRows + failedRows;
+        completedChunks += 1;
+
+        const dbStarted = Date.now();
+        if (input.onChunkComplete) {
+          await input.onChunkComplete({
+            chunkIndex: item.index,
+            totalChunks,
+            jobs: [],
+            failedRequisitionIds: failedIds,
+            model: this.model,
+            requestId: null,
+            modelLatencyMs: 0,
+            parseLatencyMs: 0,
+            inputTokens: 0,
+            outputTokens: 0,
+          });
+        }
+        counters.databaseLatencyMsTotal += Date.now() - dbStarted;
+
+        console.error("[analysis.error]", {
+          batchId,
+          chunkIndex: item.index + 1,
+          totalChunks,
+          rowCount: failedIds.length,
           model: this.model,
           error: message,
         });
-        // Continue other chunks — missing pay stays null rather than failing the whole batch
-      }
 
-      await input.onProgress?.({
-        analyzed,
-        total,
-        currentChunk: chunkIndex + 1,
-        totalChunks,
-        stage: chunkIndex + 1 >= totalChunks ? "complete" : "analyzing_grok",
-      });
+        await emitProgress({
+          processedRows,
+          successfulRows,
+          failedRows,
+          completedChunks,
+          lastError: message,
+          progressPercent: computeProgressPercent(processedRows, total),
+          stage:
+            completedChunks >= totalChunks
+              ? failedRows === total
+                ? "failed"
+                : "complete"
+              : "analyzing_grok",
+        });
+      }
     }
 
     if (allJobs.length === 0) {
       const detail = chunkErrors.slice(0, 3).join("; ") || "unknown error";
       throw new Error(
         `Grok returned no pay recommendations for ${total} jobs ` +
-          `(${failedChunks}/${totalChunks} chunks failed). ${detail}. ` +
-          `Verify GROK_MODEL (current: ${this.model}) and XAI_API_KEY.`
+          `(${chunkErrors.length}/${totalChunks} chunks failed). ${detail}. ` +
+          `Verify XAI_ANALYSIS_MODEL (current: ${this.model}) and XAI_API_KEY.`
       );
     }
 
-    if (failedChunks > 0) {
-      console.warn("[grok.pay.partial]", {
-        succeededJobs: allJobs.length,
-        totalJobs: total,
-        failedChunks,
-        totalChunks,
-      });
-    }
+    const totalElapsedMs = Date.now() - batchStarted;
+    const summary = buildPerfSummary({
+      batchId,
+      totalElapsedMs,
+      counters,
+      totalRows: total,
+      successfulRows: allJobs.length,
+      failedRows: Math.max(0, total - allJobs.length),
+    });
+    console.info("[analysis.batch.complete]", summary);
+
+    await emitProgress({
+      stage: "complete",
+      processedRows: total,
+      successfulRows: allJobs.length,
+      failedRows: Math.max(0, total - allJobs.length),
+      completedChunks: totalChunks,
+      progressPercent: 100,
+      completedAt: new Date().toISOString(),
+      estimatedCompletionAt: null,
+    });
 
     return { jobs: allJobs };
   }
 
+  private async estimatePayChunkWithRetry(
+    jobs: PayAndFillabilityInput["jobs"],
+    promptVersion: string,
+    counters: AnalysisPerfCounters,
+    batchId: string,
+    chunkIndex: number
+  ): Promise<{
+    jobs: ClaudePayAnalysisOutput["jobs"];
+    requestId: string | null;
+    modelLatencyMs: number;
+    parseLatencyMs: number;
+    inputTokens: number;
+    outputTokens: number;
+  }> {
+    const maxAttempts = 1 + this.config.maxRetries;
+    let lastError: unknown;
+
+    for (let attempt = 0; attempt < maxAttempts; attempt++) {
+      try {
+        return await this.estimatePayChunk(
+          jobs,
+          promptVersion,
+          counters,
+          batchId,
+          chunkIndex
+        );
+      } catch (err) {
+        lastError = err;
+        const message = err instanceof Error ? err.message : String(err);
+        const retryable = isRetryableGrokError(message);
+        if (!retryable || attempt >= maxAttempts - 1) {
+          throw err;
+        }
+        counters.retryCount += 1;
+        const delay = computeBackoffMs(attempt, {
+          retryAfterSeconds: extractRetryAfterSeconds(err),
+        });
+        console.warn("[analysis.chunk.retry]", {
+          batchId,
+          chunkIndex: chunkIndex + 1,
+          attempt: attempt + 1,
+          delayMs: delay,
+          error: message,
+        });
+        await sleep(delay);
+      }
+    }
+
+    throw lastError instanceof Error
+      ? lastError
+      : new Error("Grok chunk failed after retries");
+  }
+
   private async estimatePayChunk(
     jobs: PayAndFillabilityInput["jobs"],
-    promptVersion: string
-  ): Promise<ClaudePayAnalysisOutput> {
+    promptVersion: string,
+    counters: AnalysisPerfCounters,
+    batchId: string,
+    chunkIndex: number
+  ): Promise<{
+    jobs: ClaudePayAnalysisOutput["jobs"];
+    requestId: string | null;
+    modelLatencyMs: number;
+    parseLatencyMs: number;
+    inputTokens: number;
+    outputTokens: number;
+  }> {
+    const promptStarted = Date.now();
     const systemPrompt = GROK_PAY_ANALYSIS_SYSTEM_PROMPT;
     const userContent = this.buildPayAnalysisUserContent({
       jobs,
       promptVersion,
+    } as PayAndFillabilityInput);
+    counters.promptBuildMsTotal += Date.now() - promptStarted;
+    console.info("[analysis.prompt.built]", {
+      batchId,
+      chunkIndex: chunkIndex + 1,
+      rowCount: jobs.length,
+      promptBuildMs: Date.now() - promptStarted,
     });
-    const { text } = await this.callGrok(systemPrompt, userContent, {
-      jsonObject: true,
-      maxTokens: 8192,
+
+    console.info("[analysis.model.start]", {
+      batchId,
+      chunkIndex: chunkIndex + 1,
+      model: this.model,
+      rowCount: jobs.length,
     });
+
+    const { text, requestId, usage, latencyMs } = await this.callGrok(
+      systemPrompt,
+      userContent,
+      {
+        jsonObject: true,
+        maxTokens: this.config.maxOutputTokens,
+      }
+    );
+
+    counters.modelRequestCount += 1;
+    counters.modelLatencyMsTotal += latencyMs;
+    counters.modelLatencyMsMax = Math.max(
+      counters.modelLatencyMsMax,
+      latencyMs
+    );
+    counters.inputTokensTotal += usage.input ?? 0;
+    counters.outputTokensTotal += usage.output ?? 0;
+
+    console.info("[analysis.model.complete]", {
+      batchId,
+      chunkIndex: chunkIndex + 1,
+      model: this.model,
+      modelLatencyMs: latencyMs,
+      inputTokens: usage.input ?? 0,
+      outputTokens: usage.output ?? 0,
+      requestId,
+    });
+
+    const parseStarted = Date.now();
     const parsed = this.extractJsonFromResponse(text);
     const normalized = normalizeGrokPayAnalysisPayload(parsed);
 
@@ -216,18 +591,39 @@ export class GrokRequisitionService implements RequisitionIntelligenceService {
       ClaudePayAnalysisSchema,
       systemPrompt,
       userContent,
-      8192,
+      this.config.maxOutputTokens,
       /* normalizeOnRepair */ true
     );
+    const parseLatencyMs = Date.now() - parseStarted;
+    counters.parseLatencyMsTotal += parseLatencyMs;
 
-    return validated as ClaudePayAnalysisOutput;
+    console.info("[analysis.parse.complete]", {
+      batchId,
+      chunkIndex: chunkIndex + 1,
+      parseLatencyMs,
+      returnedJobs: (validated as ClaudePayAnalysisOutput).jobs.length,
+    });
+
+    return {
+      jobs: (validated as ClaudePayAnalysisOutput).jobs,
+      requestId,
+      modelLatencyMs: latencyMs,
+      parseLatencyMs,
+      inputTokens: usage.input ?? 0,
+      outputTokens: usage.output ?? 0,
+    };
   }
 
   private async callGrok(
     system: string,
     content: ChatCompletionContentPart[],
     options: { jsonObject: boolean; maxTokens: number }
-  ): Promise<{ text: string; requestId: string | null; usage: { input?: number; output?: number } }> {
+  ): Promise<{
+    text: string;
+    requestId: string | null;
+    usage: { input?: number; output?: number };
+    latencyMs: number;
+  }> {
     const client = getGrokClient();
     const started = Date.now();
 
@@ -235,7 +631,9 @@ export class GrokRequisitionService implements RequisitionIntelligenceService {
       const response = await client.chat.completions.create({
         model: this.model,
         max_tokens: options.maxTokens,
-        ...(options.jsonObject ? { response_format: { type: "json_object" } } : {}),
+        ...(options.jsonObject
+          ? { response_format: { type: "json_object" } }
+          : {}),
         messages: [
           { role: "system", content: system },
           { role: "user", content },
@@ -266,6 +664,7 @@ export class GrokRequisitionService implements RequisitionIntelligenceService {
           input: response.usage?.prompt_tokens,
           output: response.usage?.completion_tokens,
         },
+        latencyMs,
       };
     } catch (err) {
       const latencyMs = Date.now() - started;
@@ -278,7 +677,10 @@ export class GrokRequisitionService implements RequisitionIntelligenceService {
         status: "error",
         error: sanitized,
       });
-      throw new Error(sanitized);
+      throw Object.assign(new Error(sanitized), {
+        cause: err,
+        headers: (err as { headers?: unknown })?.headers,
+      });
     }
   }
 
@@ -315,9 +717,7 @@ export class GrokRequisitionService implements RequisitionIntelligenceService {
           input.spreadsheets.map((s) => ({
             filename: s.filename,
             rows: s.rows.slice(0, 50),
-          })),
-          null,
-          2
+          }))
         )}`,
       });
     }
@@ -328,10 +728,23 @@ export class GrokRequisitionService implements RequisitionIntelligenceService {
   private buildPayAnalysisUserContent(
     input: PayAndFillabilityInput
   ): ChatCompletionContentPart[] {
+    // Compact payload: evaluation fields only, no pretty-print whitespace.
+    const compactJobs = input.jobs.map((j) => ({
+      requisition_id: j.requisition_id,
+      job_title: j.job_title,
+      customer: j.customer,
+      location: j.location,
+      duration: j.duration,
+      c2c_bill_rate: j.c2c_bill_rate,
+      position_type: j.position_type,
+      remote_or_onsite: j.remote_or_onsite,
+      submissions: j.submissions,
+    }));
+
     return [
       {
         type: "text",
-        text: `Analyze competitive W-2 pay ranges and fillability for these requisitions using market-first pay rules. Prompt version: ${input.promptVersion || this.promptVersion}\n\n${JSON.stringify(input.jobs, null, 2)}`,
+        text: `Analyze competitive W-2 pay + fillability (market-first). Prompt: ${input.promptVersion || this.promptVersion}\n${JSON.stringify({ jobs: compactJobs })}`,
       },
     ];
   }
@@ -384,11 +797,10 @@ Expected schema matches the original system prompt. Return corrected JSON only.`
       },
       {
         type: "text",
-        text: `Original response to repair:\n${JSON.stringify(data, null, 2)}`,
+        text: `Original response to repair:\n${JSON.stringify(data)}`,
       },
     ];
 
-    // Keep original user context available for repair without re-running full extraction images
     const repairUserContent =
       userContent.length === 1 && userContent[0].type === "text"
         ? [...userContent, ...repairContent]
@@ -431,7 +843,6 @@ function normalizeMimeType(mime: string): string {
 
 function sanitizeGrokError(message: string): string {
   let sanitized = message;
-  // Never leak API keys if they somehow appear in error text
   sanitized = sanitized.replace(/xai-[A-Za-z0-9_-]+/g, "[redacted]");
   sanitized = sanitized.replace(/Bearer\s+\S+/gi, "Bearer [redacted]");
 
@@ -442,22 +853,17 @@ function sanitizeGrokError(message: string): string {
     return "Grok rate limit exceeded. Retry shortly.";
   }
   if (/timeout|ETIMEDOUT|AbortError/i.test(sanitized)) {
-    return "Grok request timed out. Try again or increase GROK_TIMEOUT_MS.";
+    return "Grok request timed out. Try again or increase XAI_ANALYSIS_TIMEOUT_MS.";
   }
   if (/model|not found|invalid/i.test(sanitized) && /model/i.test(sanitized)) {
-    return `Invalid or unavailable Grok model configuration. Check GROK_MODEL.`;
+    return `Invalid or unavailable Grok model configuration. Check XAI_ANALYSIS_MODEL.`;
   }
 
-  // Truncate verbose provider bodies
   if (sanitized.length > 280) {
     return `${sanitized.slice(0, 280)}…`;
   }
   return sanitized;
 }
-
-// ------------------------------------------------------------------------------
-// Factory — Grok only (no silent fallback to prior providers)
-// ------------------------------------------------------------------------------
 
 export function createRequisitionIntelligenceService(
   model?: string
@@ -465,7 +871,15 @@ export function createRequisitionIntelligenceService(
   return new GrokRequisitionService(model);
 }
 
-/** Explicit alias for clarity in call sites / tests */
+/**
+ * Vision / extraction service — always uses a vision-capable quality model.
+ * Pay analysis should call createRequisitionIntelligenceService(analysisModel).
+ */
+export function createExtractionIntelligenceService(): RequisitionIntelligenceService {
+  const cfg = getAnalysisRuntimeConfig();
+  return new GrokRequisitionService(cfg.qualityModel);
+}
+
 export function createGrokRequisitionService(
   model?: string
 ): RequisitionIntelligenceService {

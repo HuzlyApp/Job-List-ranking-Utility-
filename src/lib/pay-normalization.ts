@@ -175,6 +175,10 @@ export function normalizeGrokPayAnalysisPayload(data: unknown): unknown {
       const pay = normalizeGrokPayRecommendation(raw);
       return {
         ...raw,
+        requisition_id:
+          (typeof raw.requisition_id === "string" && raw.requisition_id) ||
+          (typeof raw.id === "string" && raw.id) ||
+          raw.requisition_id,
         recommended_w2_pay_min: pay.recommended_w2_pay_min,
         recommended_w2_pay_max: pay.recommended_w2_pay_max,
         recommended_pay_min: pay.recommended_w2_pay_min,

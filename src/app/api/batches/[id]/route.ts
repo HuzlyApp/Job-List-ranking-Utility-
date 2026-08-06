@@ -1,4 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
+import { after } from "next/server";
 import { z } from "zod";
 import {
   processBatchExtraction,
@@ -9,6 +10,8 @@ import {
   confirmReviewRows,
   runPayAnalysis,
   markBatchFailed,
+  tryClaimAnalysisWorker,
+  getAnalysisStatusPayload,
 } from "@/lib/extraction-service";
 import { sanitizeDbError, withDbRetry } from "@/db";
 
@@ -87,7 +90,18 @@ export async function POST(
         () => getBatchStatus(batchId, validated.tenantId),
         { label: "get_status" }
       );
-      return NextResponse.json({ status });
+      const analysis = await withDbRetry(
+        () => getAnalysisStatusPayload(batchId, validated.tenantId),
+        { label: "get_analysis_status" }
+      );
+      return NextResponse.json(
+        { status, analysis },
+        {
+          headers: {
+            "Cache-Control": "no-store, no-cache, must-revalidate",
+          },
+        }
+      );
     }
 
     if (validated.action === "get_review") {
@@ -104,8 +118,29 @@ export async function POST(
     }
 
     if (validated.action === "pay_analysis") {
-      await runPayAnalysis(batchId, validated.tenantId);
-      return NextResponse.json({ success: true });
+      const claim = await tryClaimAnalysisWorker(batchId, validated.tenantId);
+      if (!claim.claimed) {
+        if (claim.reason === "already_running") {
+          return NextResponse.json({ success: true, alreadyRunning: true });
+        }
+        return NextResponse.json(
+          { error: `Cannot start analysis (${claim.reason})` },
+          { status: claim.reason === "not_found" ? 404 : 409 }
+        );
+      }
+      after(async () => {
+        try {
+          await runPayAnalysis(batchId, validated.tenantId);
+        } catch (err) {
+          console.error("Background pay analysis failed:", err);
+          await markBatchFailed(
+            batchId,
+            "PAY_ANALYSIS_ERROR",
+            sanitizeDbError(err)
+          );
+        }
+      });
+      return NextResponse.json({ success: true, started: true });
     }
 
     if (validated.action === "finalize") {
@@ -115,30 +150,67 @@ export async function POST(
           { status: 400 }
         );
       }
-      await runPayAnalysis(batchId, validated.tenantId);
-      const summary = await finalizeBatch(
-        batchId,
-        validated.tenantId,
-        validated.mspProgramId,
-        validated.assumptions,
-        validated.weights
-      );
-      if (summary.uniqueRequisitionCount === 0) {
-        await markBatchFailed(
-          batchId,
-          "ZERO_FINALIZED",
-          "No requisitions were finalized"
-        );
+
+      const claim = await tryClaimAnalysisWorker(batchId, validated.tenantId);
+      if (!claim.claimed) {
+        if (claim.reason === "already_running") {
+          return NextResponse.json({
+            success: true,
+            started: false,
+            alreadyRunning: true,
+          });
+        }
+        if (claim.reason === "terminal") {
+          const analysis = await getAnalysisStatusPayload(
+            batchId,
+            validated.tenantId
+          );
+          return NextResponse.json({
+            success: true,
+            alreadyComplete: true,
+            summary: analysis.completionSummary,
+          });
+        }
         return NextResponse.json(
-          {
-            success: false,
-            error: "No requisitions were finalized",
-            summary,
-          },
-          { status: 422 }
+          { error: `Cannot start analysis (${claim.reason})` },
+          { status: claim.reason === "not_found" ? 404 : 409 }
         );
       }
-      return NextResponse.json({ success: true, summary });
+
+      const mspProgramId = validated.mspProgramId;
+      const assumptions = validated.assumptions;
+      const weights = validated.weights;
+      const tenantId = validated.tenantId;
+
+      // Durable relative to the browser: work continues after the response via after().
+      after(async () => {
+        try {
+          await runPayAnalysis(batchId, tenantId);
+          const summary = await finalizeBatch(
+            batchId,
+            tenantId,
+            mspProgramId,
+            assumptions,
+            weights
+          );
+          if (summary.uniqueRequisitionCount === 0) {
+            await markBatchFailed(
+              batchId,
+              "ZERO_FINALIZED",
+              "No requisitions were finalized"
+            );
+          }
+        } catch (err) {
+          console.error("Background finalize failed:", err);
+          await markBatchFailed(
+            batchId,
+            "PROCESSING_ERROR",
+            sanitizeDbError(err)
+          );
+        }
+      });
+
+      return NextResponse.json({ success: true, started: true });
     }
 
     return NextResponse.json({ error: "Invalid action" }, { status: 400 });
@@ -148,7 +220,14 @@ export async function POST(
 
     // Never mark the batch failed for read-only polling — that permanently
     // stuck imports after transient Neon blips during get_status.
-    if (batchId && action && MUTATING_ACTIONS.has(action)) {
+    // Also skip for finalize/pay_analysis once work was handed to after().
+    if (
+      batchId &&
+      action &&
+      MUTATING_ACTIONS.has(action) &&
+      action !== "finalize" &&
+      action !== "pay_analysis"
+    ) {
       try {
         await markBatchFailed(batchId, "PROCESSING_ERROR", safeMessage);
       } catch (markErr) {

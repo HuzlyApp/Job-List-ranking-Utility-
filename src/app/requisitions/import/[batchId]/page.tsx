@@ -59,9 +59,21 @@ interface BatchStatus {
       pay_analysis_progress?: {
         analyzed: number;
         total: number;
+        totalRows?: number;
         currentChunk: number;
         totalChunks: number;
         stage: string;
+        processedRows?: number;
+        successfulRows?: number;
+        failedRows?: number;
+        completedChunks?: number;
+        progressPercent?: number;
+        currentStage?: string;
+        selectedModel?: string | null;
+        estimatedCompletionAt?: string | null;
+        lastError?: string | null;
+        startedAt?: string | null;
+        lastActivityAt?: string | null;
       };
     };
     mspProgramId: string;
@@ -77,6 +89,39 @@ interface BatchStatus {
     errorMessage?: string;
   }>;
   sourceRows: Array<{ id: string }>;
+}
+
+interface AnalysisStatusPayload {
+  batchId: string;
+  status: string;
+  currentStage: string;
+  progressPercent: number;
+  totalRows: number;
+  processedRows: number;
+  successfulRows: number;
+  failedRows: number;
+  completedChunks: number;
+  totalChunks: number;
+  selectedModel: string | null;
+  startedAt: string | null;
+  lastActivityAt: string | null;
+  estimatedCompletionAt: string | null;
+  completedAt: string | null;
+  lastError: string | null;
+  terminal: boolean;
+  completionSummary: {
+    uniqueRequisitionCount: number;
+    newRecordsCreated: number;
+    existingRecordsUpdated: number;
+    duplicatesConsolidated: number;
+    analysesCompleted: number;
+    requiresReview: number;
+  } | null;
+  pay_analysis_progress?: BatchStatus["batch"]["processingSummary"] extends infer S
+    ? S extends { pay_analysis_progress?: infer P }
+      ? P
+      : never
+    : never;
 }
 
 interface ReviewRow {
@@ -147,6 +192,8 @@ function BatchImportPageContent({ params }: { params: Promise<{ batchId: string 
   const [mode, setMode] = useState<PageMode>("processing");
   const [error, setError] = useState<string | null>(null);
   const [analyzing, setAnalyzing] = useState(false);
+  const [analysisStatus, setAnalysisStatus] = useState<AnalysisStatusPayload | null>(null);
+  const [pollError, setPollError] = useState<string | null>(null);
   const [selectedRowId, setSelectedRowId] = useState<string | null>(null);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [completionSummary, setCompletionSummary] = useState<{
@@ -183,25 +230,71 @@ function BatchImportPageContent({ params }: { params: Promise<{ batchId: string 
   const fetchStatus = useCallback(async () => {
     if (!batchId) return;
     try {
-      const res = await fetch(`/api/batches/${batchId}`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ action: "get_status", tenantId }),
-      });
-      if (!res.ok) {
-        setError("Could not refresh import status. Retrying…");
+      const [batchRes, analysisRes] = await Promise.all([
+        fetch(`/api/batches/${batchId}`, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "Cache-Control": "no-store",
+          },
+          body: JSON.stringify({ action: "get_status", tenantId }),
+          cache: "no-store",
+        }),
+        fetch(`/api/batches/${batchId}/status?tenantId=${encodeURIComponent(tenantId)}`, {
+          headers: { "Cache-Control": "no-store" },
+          cache: "no-store",
+        }),
+      ]);
+
+      if (!batchRes.ok) {
+        setPollError("Could not refresh import status. Retrying…");
         return;
       }
-      const data = await res.json();
-      const payload = data.status;
+
+      const data = await batchRes.json();
+      const payload = data.status as BatchStatus;
       setStatus(payload);
-      const batchStatus =
-        payload?.batch?.status ||
-        payload?.status ||
-        (typeof payload === "string" ? payload : undefined);
+
+      let analysis = (data.analysis as AnalysisStatusPayload | undefined) ?? null;
+      if (!analysis && analysisRes.ok) {
+        analysis = (await analysisRes.json()) as AnalysisStatusPayload;
+      }
+      if (analysis) {
+        setAnalysisStatus(analysis);
+      }
+
+      const batchStatus = payload?.batch?.status;
       applyBatchStatus(batchStatus, payload?.batch?.sanitizedErrorMessage);
+      setPollError(null);
+
+      if (analysis?.terminal && analysis.status === "failed") {
+        setMode("failed");
+        setError(analysis.lastError || "Analysis failed");
+        setAnalyzing(false);
+        return;
+      }
+
+      if (
+        analysis?.terminal &&
+        (analysis.status === "completed" || analysis.status === "partially_completed")
+      ) {
+        if (analysis.completionSummary) {
+          setCompletionSummary({
+            sourceRowCount: analysis.completionSummary.uniqueRequisitionCount,
+            uniqueRequisitionCount: analysis.completionSummary.uniqueRequisitionCount,
+            analysesCompleted: analysis.completionSummary.analysesCompleted,
+            analysesPending: 0,
+            requiresReview: analysis.completionSummary.requiresReview,
+            newRecordsCreated: analysis.completionSummary.newRecordsCreated,
+            existingRecordsUpdated: analysis.completionSummary.existingRecordsUpdated,
+            duplicatesConsolidated: analysis.completionSummary.duplicatesConsolidated,
+          });
+        }
+        setMode("complete");
+        setAnalyzing(false);
+      }
     } catch {
-      setError("Could not refresh import status. Retrying…");
+      setPollError("Could not refresh import status. Retrying…");
     }
   }, [batchId, tenantId, applyBatchStatus]);
 
@@ -221,12 +314,34 @@ function BatchImportPageContent({ params }: { params: Promise<{ batchId: string 
 
   useEffect(() => {
     if (!batchId) return;
-    fetchStatus();
-    if (mode === "preview" || mode === "review" || mode === "complete") {
-      return;
-    }
-    const interval = setInterval(fetchStatus, 2000);
-    return () => clearInterval(interval);
+    let cancelled = false;
+    let inFlight = false;
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    let failureBackoffMs = 2000;
+
+    const tick = async () => {
+      if (cancelled || inFlight) return;
+      inFlight = true;
+      try {
+        await fetchStatus();
+        failureBackoffMs = 2000;
+      } catch {
+        failureBackoffMs = Math.min(failureBackoffMs * 1.5, 10000);
+      } finally {
+        inFlight = false;
+        if (cancelled) return;
+        if (mode === "preview" || mode === "review" || mode === "complete") {
+          return;
+        }
+        timer = setTimeout(tick, failureBackoffMs);
+      }
+    };
+
+    void tick();
+    return () => {
+      cancelled = true;
+      if (timer) clearTimeout(timer);
+    };
   }, [batchId, fetchStatus, mode]);
 
   useEffect(() => {
@@ -243,7 +358,7 @@ function BatchImportPageContent({ params }: { params: Promise<{ batchId: string 
   };
 
   const handleConfirmAndAnalyze = async () => {
-    if (!status) return;
+    if (!status || analyzing) return;
     setAnalyzing(true);
     setError(null);
     setMode("analyzing");
@@ -270,18 +385,29 @@ function BatchImportPageContent({ params }: { params: Promise<{ batchId: string 
         throw new Error(typeof err.error === "string" ? err.error : "Analysis failed");
       }
       const payload = await res.json();
-      if (!payload.summary?.uniqueRequisitionCount) {
-        throw new Error("Import finished without saving requisitions");
+      if (payload.alreadyComplete && payload.summary) {
+        setCompletionSummary({
+          sourceRowCount: payload.summary.uniqueRequisitionCount ?? 0,
+          uniqueRequisitionCount: payload.summary.uniqueRequisitionCount ?? 0,
+          analysesCompleted: payload.summary.analysesCompleted ?? 0,
+          analysesPending: 0,
+          requiresReview: payload.summary.requiresReview ?? 0,
+          newRecordsCreated: payload.summary.newRecordsCreated ?? 0,
+          existingRecordsUpdated: payload.summary.existingRecordsUpdated ?? 0,
+          duplicatesConsolidated: payload.summary.duplicatesConsolidated ?? 0,
+        });
+        setMode("complete");
+        setAnalyzing(false);
+        return;
       }
-      setCompletionSummary(payload.summary);
-      setMode("complete");
+      // Background worker started — polling drives completion.
+      await fetchStatus();
     } catch (err) {
       const message = err instanceof Error ? err.message : "Analysis failed";
       setError(message);
       setMode("failed");
-      await fetchStatus();
-    } finally {
       setAnalyzing(false);
+      await fetchStatus();
     }
   };
 
@@ -346,29 +472,55 @@ function BatchImportPageContent({ params }: { params: Promise<{ batchId: string 
   }, [batchStatus, status, importSummary, detectedCount, summary]);
 
   // Build analysis stages from live progress
-  const payProgress = summary?.pay_analysis_progress;
-  const analyzedCount = payProgress?.analyzed ?? 0;
+  const payProgress =
+    analysisStatus?.pay_analysis_progress || summary?.pay_analysis_progress;
+  const analyzedCount =
+    analysisStatus?.processedRows ??
+    payProgress?.processedRows ??
+    payProgress?.analyzed ??
+    0;
   const analysisTotal =
-    payProgress?.total || readyRows.length || detectedCount || 0;
+    analysisStatus?.totalRows ||
+    payProgress?.totalRows ||
+    payProgress?.total ||
+    readyRows.length ||
+    detectedCount ||
+    0;
+  const progressPercent =
+    analysisStatus?.progressPercent ??
+    payProgress?.progressPercent ??
+    (analysisTotal > 0 ? Math.round((analyzedCount / analysisTotal) * 100) : 0);
   const analysisStages = useMemo(() => {
-    const stage = payProgress?.stage || "analyzing_grok";
-    const grokDone = stage === "complete" || batchStatus === "calculating";
-    const calculating = batchStatus === "calculating";
+    const stage = payProgress?.stage || analysisStatus?.currentStage || "analyzing_grok";
+    const grokDone =
+      stage === "complete" ||
+      batchStatus === "calculating" ||
+      batchStatus === "persisting" ||
+      batchStatus === "completed";
+    const calculating =
+      batchStatus === "calculating" || batchStatus === "persisting";
+    const failed = batchStatus === "failed" || stage === "failed";
     return [
       { id: "prepare", label: "Preparing source data", status: "complete" as const },
       {
         id: "send1",
         label: "Analyzing with Grok",
-        status: grokDone ? ("complete" as const) : ("active" as const),
+        status: failed
+          ? ("failed" as const)
+          : grokDone
+            ? ("complete" as const)
+            : ("active" as const),
       },
       {
         id: "validate1",
         label: "Validating Grok response",
-        status: grokDone
-          ? ("complete" as const)
-          : stage === "analyzing_grok"
-            ? ("pending" as const)
-            : ("active" as const),
+        status: failed
+          ? ("failed" as const)
+          : grokDone
+            ? ("complete" as const)
+            : stage === "analyzing_grok"
+              ? ("pending" as const)
+              : ("active" as const),
       },
       {
         id: "pay",
@@ -384,11 +536,23 @@ function BatchImportPageContent({ params }: { params: Promise<{ batchId: string 
             ? ("complete" as const)
             : ("pending" as const),
       },
-      { id: "dedupe", label: "Removing duplicates", status: "pending" as const },
-      { id: "rank", label: "Ranking requisitions", status: "pending" as const },
-      { id: "save", label: "Saving requisitions", status: "pending" as const },
+      {
+        id: "dedupe",
+        label: "Removing duplicates",
+        status: batchStatus === "completed" ? ("complete" as const) : ("pending" as const),
+      },
+      {
+        id: "rank",
+        label: "Ranking requisitions",
+        status: batchStatus === "completed" ? ("complete" as const) : ("pending" as const),
+      },
+      {
+        id: "save",
+        label: "Saving requisitions",
+        status: batchStatus === "completed" ? ("complete" as const) : ("pending" as const),
+      },
     ];
-  }, [payProgress?.stage, batchStatus]);
+  }, [payProgress?.stage, analysisStatus?.currentStage, batchStatus]);
 
   // Preview rows
   const previewRows = useMemo(
@@ -564,11 +728,42 @@ function BatchImportPageContent({ params }: { params: Promise<{ batchId: string 
               <ClaudeAnalysisProgress
                 totalRequisitions={analysisTotal}
                 analyzedCount={analyzedCount}
-                currentBatch={payProgress?.currentChunk}
-                totalBatches={payProgress?.totalChunks}
+                successfulCount={
+                  analysisStatus?.successfulRows ?? payProgress?.successfulRows
+                }
+                failedCount={analysisStatus?.failedRows ?? payProgress?.failedRows}
+                progressPercent={progressPercent}
+                currentStageLabel={
+                  analysisStatus?.currentStage || payProgress?.currentStage
+                }
+                currentBatch={
+                  analysisStatus?.completedChunks ||
+                  payProgress?.completedChunks ||
+                  payProgress?.currentChunk
+                }
+                totalBatches={
+                  analysisStatus?.totalChunks || payProgress?.totalChunks
+                }
+                selectedModel={
+                  analysisStatus?.selectedModel || payProgress?.selectedModel
+                }
+                estimatedCompletionAt={
+                  analysisStatus?.estimatedCompletionAt ||
+                  payProgress?.estimatedCompletionAt
+                }
+                lastError={
+                  pollError ||
+                  analysisStatus?.lastError ||
+                  payProgress?.lastError
+                }
                 stages={analysisStages}
+                onRetry={() => {
+                  setError(null);
+                  setMode("review");
+                  setAnalyzing(false);
+                  fetchReview();
+                }}
               />
-              <SafeLeaveNotice />
             </>
           )}
 
