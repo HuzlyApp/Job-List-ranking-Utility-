@@ -12,7 +12,7 @@ import {
 import { eq, and, sql } from "drizzle-orm";
 import { v4 as uuidv4 } from "uuid";
 import type { ExtractedRequisition, FinancialAssumptions, ScoringWeights } from "@/types";
-import { createRequisitionIntelligenceService } from "@/lib/ai-providers";
+import { createRequisitionIntelligenceService, createExtractionIntelligenceService } from "@/lib/ai-providers";
 import {
   parseSpreadsheet,
   parseCSVBuffer,
@@ -48,8 +48,15 @@ import {
   normalizeRequisitionId,
 } from "@/lib/pay-validation";
 import { decimalOrNull } from "@/lib/pay-normalization";
-import { GROK_MODEL } from "@/lib/grok-provider";
 import { GROK_PROMPT_VERSION } from "@/ai/prompts/job-ranking-grok-v1";
+import { getAnalysisRuntimeConfig } from "@/lib/analysis-config";
+import {
+  emptyProgress,
+  mergeProgress,
+  stageLabel,
+  type AnalysisProgressSnapshot,
+} from "@/lib/analysis-progress";
+import type { ClaudePayAnalysisOutput } from "@/types";
 
 type RequisitionAnalysisBatch = typeof requisitionAnalysisBatches.$inferSelect;
 
@@ -335,7 +342,7 @@ export async function processBatchExtraction(
   const extractedRows: ExtractedRequisition[] = [];
 
   if (imagePayloads.length > 0) {
-    const provider = createRequisitionIntelligenceService();
+    const provider = createExtractionIntelligenceService();
 
     const result = await provider.extractRequisitions({
       images: imagePayloads.map((img) => ({
@@ -344,7 +351,7 @@ export async function processBatchExtraction(
         mimeType: img.mimeType,
       })),
       spreadsheets: spreadsheetPayloads,
-      promptVersion: "job-ranking-grok-v1",
+      promptVersion: GROK_PROMPT_VERSION,
     });
 
     for (const job of result.jobs) {
@@ -581,9 +588,20 @@ export async function runPayAnalysis(
   batchId: string,
   tenantId: string
 ): Promise<void> {
+  const analysisConfig = getAnalysisRuntimeConfig();
+  const batchStartedAt = new Date();
+
   await db
     .update(requisitionAnalysisBatches)
-    .set({ status: "analyzing" })
+    .set({
+      status: "analyzing",
+      startedAt: batchStartedAt,
+      updatedAt: batchStartedAt,
+      claudeModel: analysisConfig.model,
+      promptVersion: GROK_PROMPT_VERSION,
+      sanitizedErrorMessage: null,
+      errorCode: null,
+    })
     .where(eq(requisitionAnalysisBatches.id, batchId));
 
   const rows = await db
@@ -614,17 +632,24 @@ export async function runPayAnalysis(
     })
     .filter((j) => j.requisition_id);
 
+  const rowsByReqId = new Map<string, (typeof rows)[number]>();
+  for (const row of rows) {
+    const data = (row.confirmedJson || row.extractedJson) as ExtractedRequisition;
+    const reqId = normalizeRequisitionId(data.requisition_id);
+    if (reqId) rowsByReqId.set(reqId, row);
+  }
+  const succeededReqIds = new Set<string>();
+
   if (jobs.length === 0) {
     return;
   }
 
-  const writeProgress = async (progress: {
-    analyzed: number;
-    total: number;
-    currentChunk: number;
-    totalChunks: number;
-    stage: string;
-  }) => {
+  const totalChunks = Math.max(
+    1,
+    Math.ceil(jobs.length / analysisConfig.chunkSize)
+  );
+
+  const writeProgress = async (progress: AnalysisProgressSnapshot) => {
     const [existing] = await db
       .select({ processingSummary: requisitionAnalysisBatches.processingSummary })
       .from(requisitionAnalysisBatches)
@@ -635,161 +660,367 @@ export async function runPayAnalysis(
     };
     await db
       .update(requisitionAnalysisBatches)
-      .set({ processingSummary: summary, updatedAt: new Date() })
+      .set({
+        processingSummary: summary,
+        updatedAt: new Date(),
+        claudeModel: progress.selectedModel || analysisConfig.model,
+      })
       .where(eq(requisitionAnalysisBatches.id, batchId));
   };
 
-  try {
-    await writeProgress({
-      analyzed: 0,
-      total: jobs.length,
-      currentChunk: 0,
-      totalChunks: Math.ceil(jobs.length / 8),
+  let latestProgress = mergeProgress(
+    emptyProgress({
       stage: "analyzing_grok",
-    });
+      currentStage: stageLabel("analyzing_grok"),
+      totalRows: jobs.length,
+      totalChunks,
+      selectedModel: analysisConfig.model,
+      startedAt: batchStartedAt.toISOString(),
+      lastActivityAt: batchStartedAt.toISOString(),
+    }),
+    {}
+  );
 
-    const provider = createRequisitionIntelligenceService();
-    const analysis = await provider.estimatePayAndFillability({
-      jobs,
-      promptVersion: GROK_PROMPT_VERSION,
-      onProgress: writeProgress,
-    });
+  const persistProgress = async (patch: Partial<AnalysisProgressSnapshot>) => {
+    latestProgress = mergeProgress(latestProgress, patch);
+    await writeProgress(latestProgress);
+  };
 
-    const analysisByReqId = new Map(
-      analysis.jobs.map((j) => [j.requisition_id, j] as const)
-    );
-
-    for (const row of rows) {
-      const data = (row.confirmedJson || row.extractedJson) as ExtractedRequisition;
-      const reqId = normalizeRequisitionId(data.requisition_id);
-      if (!reqId) continue;
-      const pay = analysisByReqId.get(reqId);
-
-      if (!pay) {
-        const enriched = {
-          ...data,
-          requisition_id: reqId,
-          recommended_w2_pay_min: null,
-          recommended_w2_pay_max: null,
-          market_pay_floor: null,
-          bill_rate_supports_market_pay: null,
-          pay_estimate_reason:
-            "Grok pay analysis unavailable for this requisition. Requires manual market pay review.",
-          pay_range_confidence: "Low" as const,
-          pay_range_fit: "Requires Review" as const,
-          market_rate_warning: "Pay analysis missing; do not recruit until pay is reviewed",
-          fillability_score: 50,
-          fillability_label: "Difficult" as const,
-          requires_pay_review: true,
-          data_quality_notes: [
-            ...(Array.isArray(data.data_quality_notes) ? data.data_quality_notes : []),
-            "No Grok pay result for this requisition (chunk failed or omitted).",
-          ],
-        };
-        await db
-          .update(requisitionSourceRows)
-          .set({ confirmedJson: enriched })
-          .where(eq(requisitionSourceRows.id, row.id));
-        continue;
-      }
-
-      const validated = validatePayRecommendation({
-        requisitionId: reqId,
-        recommendedMin: pay.recommended_w2_pay_min,
-        recommendedMax: pay.recommended_w2_pay_max,
-        marketPayFloor: pay.market_pay_floor,
-        marketPayConfidence: pay.market_pay_confidence,
-        payRecommendationReason: pay.pay_recommendation_reason || pay.pay_estimate_reason,
-        billRateSupportsMarketPay: pay.bill_rate_supports_market_pay,
-        billRate: data.c2c_bill_rate,
-        jobTitle: data.job_title,
-        payRangeFit: pay.pay_range_fit,
-        marketRateWarning: pay.market_rate_warning,
-      });
-
-      if (validated.calculationAdjustments.length > 0) {
-        console.info("[pay.validation.adjustments]", {
-          requisition_id: reqId,
-          adjustments: validated.calculationAdjustments,
-        });
-      }
-
-      const qualityNotes = [
+  const applyMissingPay = async (reqId: string, note: string) => {
+    const row = rowsByReqId.get(reqId);
+    if (!row) return;
+    const data = (row.confirmedJson || row.extractedJson) as ExtractedRequisition;
+    const enriched = {
+      ...data,
+      requisition_id: reqId,
+      recommended_w2_pay_min: null,
+      recommended_w2_pay_max: null,
+      market_pay_floor: null,
+      bill_rate_supports_market_pay: null,
+      pay_estimate_reason:
+        "Grok pay analysis unavailable for this requisition. Requires manual market pay review.",
+      pay_range_confidence: "Low" as const,
+      pay_range_fit: "Requires Review" as const,
+      market_rate_warning: "Pay analysis missing; do not recruit until pay is reviewed",
+      fillability_score: 50,
+      fillability_label: "Difficult" as const,
+      requires_pay_review: true,
+      data_quality_notes: [
         ...(Array.isArray(data.data_quality_notes) ? data.data_quality_notes : []),
-        ...validated.dataQualityNotes,
-      ];
+        note,
+      ],
+    };
+    await db
+      .update(requisitionSourceRows)
+      .set({ confirmedJson: enriched })
+      .where(eq(requisitionSourceRows.id, row.id));
+  };
 
-      const enriched = {
-        ...data,
+  const applySuccessfulPay = async (
+    pay: ClaudePayAnalysisOutput["jobs"][number]
+  ) => {
+    const reqId = normalizeRequisitionId(pay.requisition_id);
+    if (!reqId) return;
+    const row = rowsByReqId.get(reqId);
+    if (!row) return;
+    const data = (row.confirmedJson || row.extractedJson) as ExtractedRequisition;
+
+    const validated = validatePayRecommendation({
+      requisitionId: reqId,
+      recommendedMin: pay.recommended_w2_pay_min,
+      recommendedMax: pay.recommended_w2_pay_max,
+      marketPayFloor: pay.market_pay_floor,
+      marketPayConfidence: pay.market_pay_confidence,
+      payRecommendationReason:
+        pay.pay_recommendation_reason || pay.pay_estimate_reason,
+      billRateSupportsMarketPay: pay.bill_rate_supports_market_pay,
+      billRate: data.c2c_bill_rate,
+      jobTitle: data.job_title,
+      payRangeFit: pay.pay_range_fit,
+      marketRateWarning: pay.market_rate_warning,
+    });
+
+    if (validated.calculationAdjustments.length > 0) {
+      console.info("[pay.validation.adjustments]", {
         requisition_id: reqId,
-        recommended_w2_pay_min: validated.recommendedMin,
-        recommended_w2_pay_max: validated.recommendedMax,
-        market_pay_floor: validated.marketPayFloor,
-        market_pay_confidence: validated.marketPayConfidence,
-        bill_rate_supports_market_pay: validated.billRateSupportsMarketPay,
-        pay_estimate_reason: validated.payRecommendationReason,
-        pay_recommendation_reason: validated.payRecommendationReason,
-        pay_range_confidence: validated.marketPayConfidence,
-        pay_range_fit: validated.payRangeFit,
-        market_rate_warning: validated.marketRateWarning,
-        fillability_score: pay.fillability_score,
-        fillability_label: pay.fillability_label,
-        fillability_reason: pay.fillability_reason,
-        suggested_risk_classification: pay.suggested_risk_classification,
-        data_quality_notes: qualityNotes,
-        requires_pay_review: validated.requiresReview,
-      };
-
-      await db
-        .update(requisitionSourceRows)
-        .set({ confirmedJson: enriched })
-        .where(eq(requisitionSourceRows.id, row.id));
+        adjustments: validated.calculationAdjustments,
+      });
     }
 
-    await writeProgress({
-      analyzed: jobs.length,
-      total: jobs.length,
-      currentChunk: Math.ceil(jobs.length / 8),
-      totalChunks: Math.ceil(jobs.length / 8),
+    const qualityNotes = [
+      ...(Array.isArray(data.data_quality_notes) ? data.data_quality_notes : []),
+      ...validated.dataQualityNotes,
+    ];
+
+    const enriched = {
+      ...data,
+      requisition_id: reqId,
+      recommended_w2_pay_min: validated.recommendedMin,
+      recommended_w2_pay_max: validated.recommendedMax,
+      market_pay_floor: validated.marketPayFloor,
+      market_pay_confidence: validated.marketPayConfidence,
+      bill_rate_supports_market_pay: validated.billRateSupportsMarketPay,
+      pay_estimate_reason: validated.payRecommendationReason,
+      pay_recommendation_reason: validated.payRecommendationReason,
+      pay_range_confidence: validated.marketPayConfidence,
+      pay_range_fit: validated.payRangeFit,
+      market_rate_warning: validated.marketRateWarning,
+      fillability_score: pay.fillability_score,
+      fillability_label: pay.fillability_label,
+      fillability_reason: pay.fillability_reason,
+      suggested_risk_classification: pay.suggested_risk_classification,
+      analysis_model: analysisConfig.model,
+      data_quality_notes: qualityNotes,
+      requires_pay_review: validated.requiresReview,
+    };
+
+    await db
+      .update(requisitionSourceRows)
+      .set({ confirmedJson: enriched })
+      .where(eq(requisitionSourceRows.id, row.id));
+  };
+
+  try {
+    await persistProgress({
+      stage: "analyzing_grok",
+      processedRows: 0,
+      successfulRows: 0,
+      failedRows: 0,
+      completedChunks: 0,
+      progressPercent: 0,
+    });
+
+    const provider = createRequisitionIntelligenceService(analysisConfig.model);
+    await provider.estimatePayAndFillability({
+      jobs,
+      batchId,
+      promptVersion: GROK_PROMPT_VERSION,
+      onProgress: async (progress) => {
+        await persistProgress(progress);
+      },
+      onChunkComplete: async (event) => {
+        console.info("[analysis.db.save.start]", {
+          batchId,
+          chunkIndex: event.chunkIndex + 1,
+          totalChunks: event.totalChunks,
+          successfulRows: event.jobs.length,
+          failedRows: event.failedRequisitionIds.length,
+        });
+        const saveStarted = Date.now();
+        for (const pay of event.jobs) {
+          await applySuccessfulPay(pay);
+          const id = normalizeRequisitionId(pay.requisition_id);
+          if (id) succeededReqIds.add(id);
+        }
+        for (const failedId of event.failedRequisitionIds) {
+          await applyMissingPay(
+            failedId,
+            "No Grok pay result for this requisition (chunk failed or omitted)."
+          );
+        }
+        console.info("[analysis.db.save.complete]", {
+          batchId,
+          chunkIndex: event.chunkIndex + 1,
+          databaseLatencyMs: Date.now() - saveStarted,
+        });
+      },
+    });
+
+    await persistProgress({
       stage: "complete",
+      processedRows: jobs.length,
+      progressPercent: 100,
+      completedAt: new Date().toISOString(),
+      currentStage: stageLabel("complete"),
     });
   } catch (err) {
     console.error("Pay analysis failed; marking rows for review (no bill-rate pay cut):", err);
-    await writeProgress({
-      analyzed: 0,
-      total: jobs.length,
-      currentChunk: 0,
-      totalChunks: Math.ceil(jobs.length / 8),
+    const message = err instanceof Error ? err.message : "Pay analysis failed";
+    await persistProgress({
       stage: "failed",
+      lastError: message,
+      currentStage: stageLabel("failed"),
     });
     for (const row of rows) {
       const data = (row.confirmedJson || row.extractedJson) as ExtractedRequisition;
-      if (!data.requisition_id) continue;
-      const enriched = {
-        ...data,
-        recommended_w2_pay_min: null,
-        recommended_w2_pay_max: null,
-        market_pay_floor: null,
-        bill_rate_supports_market_pay: null,
-        pay_estimate_reason:
-          "Grok pay analysis unavailable. Requires manual market pay review — pay was not lowered from bill rate.",
-        pay_range_confidence: "Low" as const,
-        pay_range_fit: "Requires Review" as const,
-        market_rate_warning: "Pay analysis failed; do not recruit until pay is reviewed",
-        fillability_score: 50,
-        fillability_label: "Difficult" as const,
-        requires_pay_review: true,
-        data_quality_notes: [
-          ...(Array.isArray(data.data_quality_notes) ? data.data_quality_notes : []),
-          "Grok pay analysis failed; record flagged for manual review.",
-        ],
-      };
-      await db
-        .update(requisitionSourceRows)
-        .set({ confirmedJson: enriched })
-        .where(eq(requisitionSourceRows.id, row.id));
+      const reqId = normalizeRequisitionId(data.requisition_id);
+      if (!reqId || succeededReqIds.has(reqId)) continue;
+      await applyMissingPay(
+        reqId,
+        "Grok pay analysis failed; record flagged for manual review."
+      );
     }
+    throw err;
   }
+}
+
+/**
+ * Atomically claim a batch for analysis so duplicate Analyze clicks
+ * cannot start two workers.
+ */
+export async function tryClaimAnalysisWorker(
+  batchId: string,
+  tenantId: string
+): Promise<
+  | { claimed: true }
+  | { claimed: false; reason: "not_found" | "already_running" | "terminal" }
+> {
+  const [batch] = await db
+    .select({
+      id: requisitionAnalysisBatches.id,
+      status: requisitionAnalysisBatches.status,
+    })
+    .from(requisitionAnalysisBatches)
+    .where(
+      and(
+        eq(requisitionAnalysisBatches.id, batchId),
+        eq(requisitionAnalysisBatches.tenantId, tenantId)
+      )
+    );
+
+  if (!batch) return { claimed: false, reason: "not_found" };
+
+  if (
+    batch.status === "analyzing" ||
+    batch.status === "calculating" ||
+    batch.status === "persisting"
+  ) {
+    return { claimed: false, reason: "already_running" };
+  }
+
+  if (
+    batch.status === "completed" ||
+    batch.status === "partially_completed" ||
+    batch.status === "cancelled"
+  ) {
+    return { claimed: false, reason: "terminal" };
+  }
+
+  const claimable = [
+    "awaiting_review",
+    "reviewing",
+    "failed",
+    "uploaded",
+    "parsing",
+    "extracting",
+  ] as const;
+
+  if (!(claimable as readonly string[]).includes(batch.status)) {
+    return { claimed: false, reason: "already_running" };
+  }
+
+  const analysisConfig = getAnalysisRuntimeConfig();
+  const now = new Date();
+  const initialProgress = emptyProgress({
+    stage: "queued",
+    currentStage: stageLabel("queued"),
+    selectedModel: analysisConfig.model,
+    startedAt: now.toISOString(),
+    lastActivityAt: now.toISOString(),
+  });
+
+  const [existing] = await db
+    .select({ processingSummary: requisitionAnalysisBatches.processingSummary })
+    .from(requisitionAnalysisBatches)
+    .where(eq(requisitionAnalysisBatches.id, batchId));
+
+  await db
+    .update(requisitionAnalysisBatches)
+    .set({
+      status: "analyzing",
+      startedAt: now,
+      updatedAt: now,
+      claudeModel: analysisConfig.model,
+      promptVersion: GROK_PROMPT_VERSION,
+      errorCode: null,
+      sanitizedErrorMessage: null,
+      processingSummary: {
+        ...((existing?.processingSummary as Record<string, unknown>) || {}),
+        pay_analysis_progress: initialProgress,
+      },
+    })
+    .where(
+      and(
+        eq(requisitionAnalysisBatches.id, batchId),
+        eq(requisitionAnalysisBatches.tenantId, tenantId),
+        eq(requisitionAnalysisBatches.status, batch.status)
+      )
+    );
+
+  // Re-read to confirm claim won the race
+  const [after] = await db
+    .select({ status: requisitionAnalysisBatches.status, updatedAt: requisitionAnalysisBatches.updatedAt })
+    .from(requisitionAnalysisBatches)
+    .where(eq(requisitionAnalysisBatches.id, batchId));
+
+  if (after?.status !== "analyzing") {
+    return { claimed: false, reason: "already_running" };
+  }
+
+  return { claimed: true };
+}
+
+/**
+ * Public analysis status payload for polling UIs.
+ */
+export async function getAnalysisStatusPayload(
+  batchId: string,
+  tenantId: string
+) {
+  const status = await getBatchStatus(batchId, tenantId);
+  const progressRaw = (status.batch.processingSummary as Record<string, unknown> | null)
+    ?.pay_analysis_progress as Partial<AnalysisProgressSnapshot> | undefined;
+  const progress = mergeProgress(
+    emptyProgress({
+      selectedModel: status.batch.status === "analyzing"
+        ? getAnalysisRuntimeConfig().model
+        : null,
+    }),
+    {
+      ...progressRaw,
+      analyzed: progressRaw?.processedRows ?? progressRaw?.analyzed ?? 0,
+      total: progressRaw?.totalRows ?? progressRaw?.total ?? 0,
+    }
+  );
+
+  const terminal =
+    status.batch.status === "completed" ||
+    status.batch.status === "partially_completed" ||
+    status.batch.status === "failed" ||
+    status.batch.status === "cancelled";
+
+  const summary = status.batch.processingSummary as Record<string, unknown> | null;
+
+  return {
+    batchId,
+    status: status.batch.status,
+    currentStage: progress.currentStage,
+    progressPercent: progress.progressPercent,
+    totalRows: progress.totalRows || progress.total,
+    processedRows: progress.processedRows || progress.analyzed,
+    successfulRows: progress.successfulRows,
+    failedRows: progress.failedRows,
+    completedChunks: progress.completedChunks,
+    totalChunks: progress.totalChunks,
+    selectedModel: progress.selectedModel,
+    startedAt: progress.startedAt || status.batch.startedAt,
+    lastActivityAt: progress.lastActivityAt || status.batch.startedAt,
+    estimatedCompletionAt: progress.estimatedCompletionAt,
+    completedAt: progress.completedAt || status.batch.completedAt,
+    lastError: progress.lastError || status.batch.sanitizedErrorMessage,
+    terminal,
+    completionSummary: terminal
+      ? {
+          uniqueRequisitionCount: Number(summary?.uniqueRequisitionCount ?? 0),
+          newRecordsCreated: Number(summary?.newRecordsCreated ?? 0),
+          existingRecordsUpdated: Number(summary?.existingRecordsUpdated ?? 0),
+          duplicatesConsolidated: Number(summary?.duplicatesConsolidated ?? 0),
+          analysesCompleted: Number(summary?.analysesCompleted ?? 0),
+          requiresReview: Number(summary?.requiresReview ?? 0),
+        }
+      : null,
+    pay_analysis_progress: progress,
+  };
 }
 
 /**
@@ -1469,7 +1700,7 @@ export async function finalizeBatch(
         calculatedRecommendation: recommendation,
         finalRecommendation: recommendation,
         requiresManualReview,
-        claudeModel: GROK_MODEL,
+        claudeModel: getAnalysisRuntimeConfig().model,
         promptVersion: GROK_PROMPT_VERSION,
       };
       

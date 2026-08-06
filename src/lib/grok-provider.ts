@@ -1,17 +1,35 @@
 import "server-only";
 import OpenAI from "openai";
-
-const timeout = Number(process.env.GROK_TIMEOUT_MS || 60000);
-const maxRetries = Number(process.env.GROK_MAX_RETRIES || 1);
+import {
+  getAnalysisRuntimeConfig,
+  type ConfirmedXaiAnalysisModel,
+} from "@/lib/analysis-config";
 
 /**
- * Centralized default Grok model (vision-capable).
- * Override with GROK_MODEL — do not hardcode elsewhere.
- * grok-2-vision-1212 was deprecated by xAI (2026-02-28).
+ * Centralized Grok client. Pay-analysis model selection lives in analysis-config.
+ * Override with XAI_ANALYSIS_MODEL / GROK_MODEL — do not hardcode model IDs in call sites.
  */
-const DEFAULT_GROK_MODEL = "grok-4.5";
+const DEFAULT_VISION_MODEL: ConfirmedXaiAnalysisModel = "grok-4.5";
 
-export const GROK_MODEL = process.env.GROK_MODEL || DEFAULT_GROK_MODEL;
+function resolveClientTimeout(): number {
+  return getAnalysisRuntimeConfig().timeoutMs;
+}
+
+function resolveClientRetries(): number {
+  return getAnalysisRuntimeConfig().maxRetries;
+}
+
+/** Active model for vision extraction (quality) and default display. */
+export function getConfiguredGrokModel(): ConfirmedXaiAnalysisModel {
+  try {
+    return getAnalysisRuntimeConfig().model;
+  } catch {
+    return DEFAULT_VISION_MODEL;
+  }
+}
+
+/** @deprecated Prefer getAnalysisRuntimeConfig().model for pay analysis */
+export const GROK_MODEL = process.env.GROK_MODEL || DEFAULT_VISION_MODEL;
 
 export const GROK_PROVIDER = "xai" as const;
 
@@ -24,9 +42,13 @@ function requireXaiApiKey(): string {
 }
 
 let _client: OpenAI | null = null;
+let _clientKey: string | null = null;
 
 export function getGrokClient(): OpenAI {
-  if (_client) return _client;
+  const timeout = resolveClientTimeout();
+  const maxRetries = resolveClientRetries();
+  const key = `${timeout}:${maxRetries}`;
+  if (_client && _clientKey === key) return _client;
 
   _client = new OpenAI({
     apiKey: requireXaiApiKey(),
@@ -34,7 +56,7 @@ export function getGrokClient(): OpenAI {
     timeout,
     maxRetries,
   });
-
+  _clientKey = key;
   return _client;
 }
 
@@ -49,7 +71,14 @@ export const grokClient = {
  * Models known to support image input. If GROK_MODEL is set to a text-only
  * model and images are supplied, callers must fail clearly.
  */
-const VISION_MODEL_HINTS = ["vision", "grok-2", "grok-3", "grok-4", "grok-4.5"];
+const VISION_MODEL_HINTS = [
+  "vision",
+  "grok-2",
+  "grok-3",
+  "grok-4",
+  "grok-4.5",
+  "grok-4.3",
+];
 
 export function assertGrokSupportsImages(model: string = GROK_MODEL): void {
   const lower = model.toLowerCase();
@@ -57,17 +86,22 @@ export function assertGrokSupportsImages(model: string = GROK_MODEL): void {
   if (!supports) {
     throw new Error(
       `Configured Grok model "${model}" does not support image input. ` +
-        `Set GROK_MODEL to a vision-capable model (e.g. grok-4.5).`
+        `Set GROK_MODEL / XAI_ANALYSIS_QUALITY_MODEL to a vision-capable model (e.g. grok-4.5).`
     );
   }
 }
 
 export function getGrokConfigMeta() {
+  const cfg = getAnalysisRuntimeConfig();
   return {
     provider: GROK_PROVIDER,
-    model: GROK_MODEL,
-    timeoutMs: timeout,
-    maxRetries,
+    model: cfg.model,
+    mode: cfg.mode,
+    timeoutMs: cfg.timeoutMs,
+    maxRetries: cfg.maxRetries,
+    concurrency: cfg.concurrency,
+    chunkSize: cfg.chunkSize,
+    maxOutputTokens: cfg.maxOutputTokens,
     baseUrlConfigured: Boolean(process.env.GROK_BASE_URL || true),
   };
 }
